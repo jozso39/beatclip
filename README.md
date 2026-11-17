@@ -18,14 +18,24 @@ It is for videos where a web page draws every frame as a pure function of the so
 Needs [Bun](https://bun.sh), Google Chrome, and `ffmpeg` and `ffprobe` on the PATH. Developed on macOS; it should run on Linux, and it is not written for Windows (it uses `sh` and `ps`).
 
 ```bash
-git clone https://github.com/jozso39/beatclip.git
+curl -fsSL https://raw.githubusercontent.com/jozso39/beatclip/main/install.sh | sh
 ```
+
+This clones the repository to `~/.beatclip`, puts `beatclip` on your PATH and links the [Claude Code skill](#claude-code-skill) into `~/.claude/skills`. Run it again to update. From a clone of your own, `sh install.sh` installs that clone instead.
+
+Then, in your video project:
 
 ```bash
-cd beatclip && bun install && bun link
+beatclip doctor
 ```
 
-`beatclip` is then on your PATH. Run it from the project folder (it looks for `beatclip.config.json` there and in the parent folders), or pass `--project <folder>`, or set `BEATCLIP_PROJECT`.
+`doctor` checks the machine (Bun, ffmpeg, Chrome) and the project (config, audio, lyrics, beat grid, the page and its hooks) and says how to fix what is missing. `beatclip init` writes a starter config, and `beatclip docs` prints this manual.
+
+Run `beatclip` from the project folder (it looks for `beatclip.config.json` there and in the parent folders), or pass `--project <folder>`, or set `BEATCLIP_PROJECT`.
+
+## Claude Code skill
+
+[skills/beatclip/SKILL.md](skills/beatclip/SKILL.md) teaches Claude Code to use the tool: installing it, setting up a project, every command, and the routine for a round of timestamped notes (record the note, find its shot, keep a before frame, change, compare, render, prove, diff, check, report). The installer links it into `~/.claude/skills/beatclip`, so it is available in every session and is updated together with the tool.
 
 ## Try the demo
 

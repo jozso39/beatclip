@@ -34,6 +34,31 @@ beforeAll(async () => {
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
+test("doctor, init and docs", async () => {
+  const ok = await cli("doctor");
+  expect(ok.code).toBe(0);
+  expect(ok.json.ready).toBe(true);
+  expect(ok.json.checks.find((c: any) => c.what === "window.__shots").detail).toBe("4 shots");
+
+  // A config pointing at a page without the hooks: doctor says which one is wrong and exits 1.
+  const config = resolve(dir, "beatclip.config.json");
+  const good = readFileSync(config, "utf8");
+  writeFileSync(config, good.replace('"shots": "__shots"', '"shots": "__nothing"'));
+  const bad = await cli("doctor");
+  writeFileSync(config, good);
+  expect(bad.code).toBe(1);
+  expect(bad.json.checks.find((c: any) => c.level === "FAIL").what).toBe("window.__nothing");
+
+  const empty = mkdtempSync(resolve(tmpdir(), "beatclip-init-"));
+  const init = (...args: string[]) => Bun.spawnSync(["bun", CLI, "init", ...args], { cwd: empty });
+  expect(init("--url", "http://localhost:4000/?render=1", "--fps", "30").exitCode).toBe(0);
+  expect(JSON.parse(readFileSync(resolve(empty, "beatclip.config.json"), "utf8"))).toMatchObject({ page: { url: "http://localhost:4000/?render=1" }, fps: 30 });
+  expect(init().exitCode).toBe(1);
+  rmSync(empty, { recursive: true });
+
+  expect((await cli("docs")).json.readme).toContain("# beatclip");
+}, 60000);
+
 test("at, find and beat read the shot list from the page", async () => {
   const at = (await cli("at", "0:04.2")).json;
   expect(at.shot).toMatchObject({ id: "bounce", s: 3, e: 6, file: "scene.js:8" });

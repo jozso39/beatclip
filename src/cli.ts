@@ -19,6 +19,10 @@ const HELP = `beatclip: edit code-rendered music videos from timestamped notes
   beatclip check [--update-allow]           lyric-word sync check and probe rules
   beatclip probe <name> [times..]           the box of a data-probe element over time
 
+  beatclip doctor                           check this machine and this project, and say how to fix what is missing
+  beatclip init [--url <page>]              write a starter beatclip.config.json here
+  beatclip docs                             the full manual
+
 Times are written 1:07, 1:07.5 or 67.5. Every command takes --json and --project <folder with beatclip.config.json>.`;
 
 async function main(argv: string[]): Promise<Result> {
@@ -31,6 +35,12 @@ async function main(argv: string[]): Promise<Result> {
   const project = () => loadProject(config());
 
   switch (command) {
+    case "doctor":
+      return (await import("./commands/setup")).doctor(args, cwd, explicit);
+    case "init":
+      return (await import("./commands/setup")).init(args, cwd);
+    case "docs":
+      return (await import("./commands/setup")).docs();
     case "at":
       return (await import("./commands/lookup")).at(await project(), args);
     case "find":
