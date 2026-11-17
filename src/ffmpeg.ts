@@ -65,13 +65,31 @@ export async function grabFrame(video: string, info: VideoInfo, t: number, width
   if (!existsSync(out) || statSync(out).size === 0) throw new CliError(`ffmpeg wrote no frame for ${t.toFixed(2)} s of ${video}`);
 }
 
-/** Similarity of two pictures, 0..1 (SSIM over all channels). */
-export async function ssim(a: string, b: string): Promise<number> {
-  const r = await must(["ffmpeg", "-loglevel", "info", "-i", a, "-i", b, "-lavfi", "ssim", "-f", "null", "-"], "comparing two frames");
-  const m = r.stderr.match(/All:([\d.]+)/);
-  if (!m) throw new CliError("ffmpeg printed no SSIM value");
-  return Number(m[1]);
+/** Writes a picture scaled to `width` as a JPEG (the same scaler video frames go through, so the two stay comparable). */
+export async function scalePicture(src: string, width: number, out: string): Promise<void> {
+  await must(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vf", `scale=${width}:-2`, "-q:v", "3", out], `scaling ${src}`);
 }
+
+/**
+ * The filter that measures how different two inputs are, frame by frame: both are scaled to 480 px wide,
+ * subtracted in RGB, averaged over 8x8 blocks, and the largest block average is printed (0 = identical, 255 = black against white).
+ * Unlike a whole-frame score it stays sensitive to a small element that changed, and it ignores compression noise (below about 4).
+ */
+function differenceFilter(aspect: number): string {
+  const size = `scale=480:${Math.round(480 / aspect / 8) * 8}`;
+  return `[0:v]${size},format=gbrp[a];[1:v]${size},format=gbrp[b];[a][b]blend=all_mode=difference,format=gray,scale=iw/8:ih/8:flags=area,signalstats,metadata=print:key=lavfi.signalstats.YMAX:file=-`;
+}
+
+/** Difference of every frame of two videos (or of two pictures: one value). `aspect` is width / height. */
+export async function differences(a: string, b: string, aspect: number): Promise<number[]> {
+  const r = await must(["ffmpeg", "-loglevel", "error", "-i", a, "-i", b, "-lavfi", differenceFilter(aspect), "-f", "null", "-"], `comparing ${a} with ${b}`);
+  const values = [...r.stdout.matchAll(/YMAX=([\d.]+)/g)].map((m) => Number(m[1]));
+  if (!values.length) throw new CliError(`ffmpeg compared no frames of ${a} and ${b}`);
+  return values;
+}
+
+/** Difference of two pictures, 0 (identical) to 255. */
+export const difference = async (a: string, b: string, aspect: number) => (await differences(a, b, aspect))[0];
 
 /** Runs `fn` over `items` with at most `limit` running at once, keeping order. */
 export async function pool<T, R>(items: T[], limit: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {

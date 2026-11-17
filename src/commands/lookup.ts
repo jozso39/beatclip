@@ -5,6 +5,8 @@ import { CliError, fmtBoth, fmtDelta, fmtTime, parseTime, round3 } from "../time
 export interface Result {
   data: unknown;
   text: string;
+  /** Exit code when the command ran but found problems (default 0). */
+  exit?: number;
 }
 
 const span = (s: number, e: number) => `${fmtTime(s)}–${fmtTime(e)}`;

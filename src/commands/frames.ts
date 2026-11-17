@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
 import type { Browser } from "playwright-core";
 import type { Args } from "../args";
-import { launchBrowser, openSession, seek, type Session } from "../browser";
-import { grabFrame, pool, probeVideo, ssim } from "../ffmpeg";
+import { launchBrowser, openSession, shootPicture, type Session } from "../browser";
+import { difference, grabFrame, pool, probeVideo } from "../ffmpeg";
 import { describe, nearestBeat, shotById, wordByKey, type Project } from "../project";
 import { composeSheets, uniquePath, type Tile } from "../sheet";
 import { CliError, fmtTime, parseTime, round3, stamp } from "../time";
@@ -62,15 +62,13 @@ export function pickTimes(p: Project, args: Args): { times: number[]; slug: stri
   return { times: snapped, slug };
 }
 
-/** Screenshots the live page at each time into `work`, returning the files in order. */
+/** Shoots the live page at each time into `work`, returning the files in order. */
 async function shootLive(session: Session, p: Project, times: number[], width: number, work: string, tag: string): Promise<string[]> {
-  const page = await session.open(width / p.cfg.page.width);
+  const page = await session.open(p.cfg.render.scale);
   const files: string[] = [];
   for (const [i, t] of times.entries()) {
-    await seek(page, p.cfg, t);
-    const file = resolve(work, `${tag}-${i}.jpg`);
-    await page.screenshot({ path: file, type: "jpeg", quality: 88 });
-    files.push(file);
+    files.push(resolve(work, `${tag}-${i}.jpg`));
+    await shootPicture(page, p.cfg, t, width, files[i]);
   }
   await page.context().close();
   return files;
@@ -113,12 +111,13 @@ export async function frames(p: Project, args: Args, cwd: string): Promise<Resul
     browser = session?.browser ?? (await launchBrowser(p.cfg));
     const a = video ? await shootVideo(video, times, width, work, "a") : await shootLive(session!, p, times, width, work, "a");
     const b = other ? await shootVideo(other, times, width, work, "b") : null;
-    // When comparing, each label carries how alike the two pictures are (SSIM, 1.000 = identical).
-    const alike = b ? await pool(times, 6, (_, i) => ssim(a[i], b[i])) : null;
+    // When comparing, each label carries how different the two pictures are (0 = identical, see `differences`).
+    const aspect = p.cfg.page.width / p.cfg.page.height;
+    const diffs = b ? await pool(times, 6, (_, i) => difference(a[i], b[i], aspect)) : null;
     const beatStep = args.has("beats") ? (args.has("half") ? 0.5 : 1) : null;
     const tiles: Tile[] = times.map((t, i) => ({
       images: b ? [a[i], b[i]] : [a[i]],
-      label: tileLabel(p, t, beatStep) + (alike ? `  same ${alike[i].toFixed(3)}` : ""),
+      label: tileLabel(p, t, beatStep) + (diffs ? `  diff ${diffs[i].toFixed(1)}${diffs[i] >= p.cfg.differs ? " ≠" : ""}` : ""),
     }));
     const title = `${slug}  ·  ${other ? `left: ${sourceA}  ·  right: ${basename(other)}` : sourceA}  ·  ${times.length} frames  ·  ${new Date().toLocaleString()}`;
 
@@ -129,8 +128,9 @@ export async function frames(p: Project, args: Args, cwd: string): Promise<Resul
       return explicit ? resolve(dirname(explicit), `${name(explicit)}${suffix}.png`) : uniquePath(p.cfg.out.sheets, `${base}${suffix}`, "png");
     };
     const sheets = await composeSheets(browser, { title, tiles, cols, width, perSheet: cols * (args.num("rows") ?? 6) }, work, dest);
-    const data = { sheets, source: sourceA, compare: other ? basename(other) : null, tiles: times.map((t, i) => ({ t, time: fmtTime(t), label: tiles[i].label, ...(alike ? { same: round3(alike[i]) } : {}) })) };
-    return { data, text: [...sheets, `${times.length} frames from ${sourceA}${other ? ` beside ${basename(other)}` : ""}: ${fmtTime(times[0])} to ${fmtTime(times.at(-1)!)}`].join("\n") };
+    const data = { sheets, source: sourceA, compare: other ? basename(other) : null, tiles: times.map((t, i) => ({ t, time: fmtTime(t), label: tiles[i].label, ...(diffs ? { diff: round3(diffs[i]), differs: diffs[i] >= p.cfg.differs } : {}) })) };
+    const changed = diffs ? `; ${diffs.filter((d) => d >= p.cfg.differs).length} of ${times.length} differ (diff >= ${p.cfg.differs})` : "";
+    return { data, text: [...sheets, `${times.length} frames from ${sourceA}${other ? ` beside ${basename(other)}` : ""}: ${fmtTime(times[0])} to ${fmtTime(times.at(-1)!)}${changed}`].join("\n") };
   } finally {
     await (session ? session.close() : browser?.close());
     rmSync(work, { recursive: true, force: true });

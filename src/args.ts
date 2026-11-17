@@ -3,7 +3,7 @@ import { CliError, parseTime } from "./time";
 /** Flags that never take a value; everything else written as --name takes the next token. */
 const SWITCHES = new Set([
   "json", "help", "next", "prev", "half", "beats", "full", "no-verify", "no-encode", "no-widen",
-  "update-allow", "excerpt", "lowest", "highest", "all",
+  "update-allow", "excerpt", "lowest", "highest", "all", "notes",
 ]);
 
 export class Args {

@@ -1,0 +1,9 @@
+{
+ "allow": [
+  {
+   "key": "a3.3",
+   "kind": "early",
+   "why": "deliberate: the demo keeps one early word to show a known exception"
+  }
+ ]
+}

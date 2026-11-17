@@ -47,10 +47,14 @@ export interface Config {
   beats: BeatsConfig;
   out: { sheets: string; cache: string; video: string; proofs: string };
   notes: string;
-  render: { workers: number; quality: number; scale: number; crf: number; preset: string; settleMs: number; samples: number; same: number };
+  /** Two frames count as different when their difference (0..255, see ffmpeg.ts) reaches this. */
+  differs: number;
+  render: { workers: number; quality: number; scale: number; crf: number; preset: string; settleMs: number; samples: number; differs: number };
   check: {
     /** CSS selector of a word's element; {line} and {word} are replaced. */
     selector: string;
+    /** Also check the letters of `shouts`. */
+    shouts: boolean;
     before: number;
     after: number;
     visible: number;
@@ -136,9 +140,11 @@ export function loadConfig(file: string): Config {
       proofs: inOut(raw.out?.proofs, "proofs"),
     },
     notes: path(raw.notes ?? "beatclip.notes.json"),
-    render: { workers: 8, quality: 93, scale: 1, crf: 17, preset: "medium", settleMs: 1500, samples: 40, same: 0.999, ...raw.render },
+    differs: raw.differs ?? 10,
+    render: { workers: 8, quality: 93, scale: 1, crf: 17, preset: "medium", settleMs: 1500, samples: 40, differs: 8, ...raw.render },
     check: {
       selector: raw.check?.selector ?? '[data-word="{line}:{word}"]',
+      shouts: raw.check?.shouts ?? false,
       before: raw.check?.before ?? 0.15,
       after: raw.check?.after ?? 0.02,
       visible: raw.check?.visible ?? 0.85,

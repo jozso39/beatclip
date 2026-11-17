@@ -15,7 +15,15 @@ times = librosa.frames_to_time(frames, sr=sr)
 json.dump({"tempo": float(np.atleast_1d(tempo)[0]), "beats": [round(float(t), 4) for t in times]}, sys.stdout)
 `;
 
-const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+/** The constant grid closest to measured beats: a least-squares line through (beat number, time). */
+export function fitGrid(beats: number[]): { first: number; interval: number; worst: number } {
+  const n = beats.length;
+  const meanI = (n - 1) / 2;
+  const meanT = beats.reduce((a, b) => a + b, 0) / n;
+  const interval = beats.reduce((sum, t, i) => sum + (i - meanI) * (t - meanT), 0) / beats.reduce((sum, _, i) => sum + (i - meanI) ** 2, 0);
+  const first = meanT - interval * meanI;
+  return { first, interval, worst: Math.max(...beats.map((t, i) => Math.abs(t - (first + i * interval)))) };
+}
 
 /**
  * `analyze beats [audio]`: tracks the beats of an audio file with librosa and writes a beats file.
@@ -39,11 +47,8 @@ export async function analyze(cfg: Config | null, args: Args, cwd: string): Prom
   const { tempo, beats } = JSON.parse(r.stdout) as { tempo: number; beats: number[] };
   if (beats.length < 2) throw new CliError(`librosa found ${beats.length} beats in ${audio}; not enough for a grid`);
 
-  // How well a constant grid would fit: its interval is the median gap, its first beat the median offset.
-  const interval = median(beats.slice(1).map((b, i) => b - beats[i]));
-  const first = median(beats.map((b, i) => b - i * interval));
-  const worst = Math.max(...beats.map((b, i) => Math.abs(b - (first + i * interval))));
-  const fit = { first: Math.round(first * 1000) / 1000, interval: Math.round(interval * 10000) / 10000, worstMs: Math.round(worst * 1000) };
+  const g = fitGrid(beats);
+  const fit = { first: Math.round(g.first * 1000) / 1000, interval: Math.round(g.interval * 10000) / 10000, worstMs: Math.round(g.worst * 1000) };
 
   writeFileSync(out, JSON.stringify({ source: basename(audio), tempo: Math.round(tempo * 100) / 100, beats }, null, 1));
   return {

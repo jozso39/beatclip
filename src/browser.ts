@@ -1,5 +1,7 @@
 import { chromium, type Browser, type Page } from "playwright-core";
+import { rmSync } from "node:fs";
 import type { Config } from "./config";
+import { scalePicture } from "./ffmpeg";
 import { CliError } from "./time";
 
 async function reachable(url: string): Promise<boolean> {
@@ -85,3 +87,15 @@ export const seek = (page: Page, cfg: Config, t: number) =>
 
 /** Reads a hook's value from the page (duration, shot list). */
 export const readHook = <T>(page: Page, name: string) => page.evaluate((n) => (window as any)[n], name) as Promise<T>;
+
+/**
+ * Saves the page's picture of time `t` as a JPEG `width` pixels wide. The page (opened at the render scale) is shot
+ * at full size and scaled afterwards: a page drawn small renders text differently from a scaled-down video frame.
+ */
+export async function shootPicture(page: Page, cfg: Config, t: number, width: number, out: string): Promise<void> {
+  await seek(page, cfg, t);
+  const full = out.replace(/\.jpg$/, ".full.jpg");
+  await page.screenshot({ path: full, type: "jpeg", quality: cfg.render.quality });
+  await scalePicture(full, width, out);
+  rmSync(full);
+}

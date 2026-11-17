@@ -1,7 +1,11 @@
 import { describe as group, expect, test } from "bun:test";
 import { resolve } from "node:path";
 import { Args } from "../src/args";
+import { fitGrid } from "../src/commands/analyze";
+import { differingRanges } from "../src/commands/diff";
+import { extremes } from "../src/commands/check";
 import { beat, find } from "../src/commands/lookup";
+import { inRanges, mergeRanges, pickSamples } from "../src/commands/render";
 import type { Config } from "../src/config";
 import { constantGrid, describe, listGrid, loadLines, nearestBeat, type Project } from "../src/project";
 import { fmtTime, parseTime } from "../src/time";
@@ -61,6 +65,12 @@ group("beat grids", () => {
     expect(nearestBeat(g, 67.1)).toEqual({ n: 134, t: 67.25, delta: -0.15 });
     expect(nearestBeat(g, 67.05, true).n).toBe(133.5);
   });
+  test("the constant grid fitted to measured beats", () => {
+    const fit = fitGrid([0.26, 0.74, 1.25, 1.76, 2.24]);
+    expect(fit.interval).toBeCloseTo(0.498, 3);
+    expect(fit.first).toBeCloseTo(0.254, 3);
+    expect(fit.worst).toBeCloseTo(0.012, 3);
+  });
   test("measured beats interpolate and continue past both ends", () => {
     const g = listGrid([1, 2, 4, 5]);
     expect(g.pos(3)).toBe(1.5);
@@ -111,5 +121,33 @@ group("lookups on the demo project", () => {
     expect(at("4.2", "+4")).toMatchObject({ n: 11, t: 6 });
     expect(at("4.2", "--prev", "-2")).toMatchObject({ n: 5, t: 3 });
     expect(at("--n", "8")).toMatchObject({ n: 8, t: 4.5 });
+  });
+});
+
+group("ranges", () => {
+  test("differing frames join into ranges across short gaps", () => {
+    const diffs = [0, 9, 9, 0, 9, 0, 0, 0, 0, 30, 0];
+    expect(differingRanges(diffs, 10, 6, 2)).toEqual([
+      { from: 0.1, to: 0.5, peak: 9, peakAt: 0.1 },
+      { from: 0.9, to: 1, peak: 30, peakAt: 0.9 },
+    ]);
+    expect(differingRanges(diffs, 10, 31, 2)).toEqual([]);
+  });
+  test("frame ranges merge when they touch or overlap", () => {
+    expect(mergeRanges([[5, 9], [0, 3], [3, 4], [8, 12], [20, 20]])).toEqual([[0, 4], [5, 12]]);
+  });
+  test("check samples lie outside the re-shot ranges and include their neighbours and every other shot", () => {
+    const p = demoProject();
+    const ranges: [number, number][] = [[90, 180]];
+    const picks = pickSamples(p, ranges, 360, 30, () => 0.5);
+    expect(picks.some((f) => inRanges(ranges, f))).toBe(false);
+    for (const f of [89, 180, 45, 225, 315]) expect(picks).toContain(f);
+    expect(picks.length).toBe(30);
+  });
+  test("turning points of a moving box", () => {
+    const box = (bottom: number) => ({ shown: 1, left: 0, right: 10, top: bottom - 10, bottom });
+    const series = [50, 80, 100, 100, 70, 40, 60, 90, 60].map((y, i) => ({ t: i / 10, box: box(y) }));
+    expect(extremes(series, "lowest")).toEqual([{ t: 0.25, y: 100 }, { t: 0.7, y: 90 }]);
+    expect(extremes(series, "highest")).toEqual([{ t: 0.5, y: 30 }]);
   });
 });

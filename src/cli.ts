@@ -13,6 +13,11 @@ const HELP = `beatclip: edit code-rendered music videos from timestamped notes
   beatclip analyze beats <audio>            write a beat-times file with librosa (optional, needs Python)
   beatclip frames [times..] [--from --to --every] [--shot id] [--word line.n --window s] [--beats]
                     [--video a.mp4] [--compare b.mp4]          labelled contact sheets, live page or rendered file
+  beatclip render [--from t --to t] [--shot id] [--notes] [--out file]   full or partial render via the frame cache
+  beatclip notes add|list|set|proof|report  the ledger of change notes
+  beatclip diff <a.mp4> <b.mp4>             time ranges where two drafts differ, and which no note explains
+  beatclip check [--update-allow]           lyric-word sync check and probe rules
+  beatclip probe <name> [times..]           the box of a data-probe element over time
 
 Times are written 1:07, 1:07.5 or 67.5. Every command takes --json and --project <folder with beatclip.config.json>.`;
 
@@ -43,6 +48,16 @@ async function main(argv: string[]): Promise<Result> {
     }
     case "frames":
       return (await import("./commands/frames")).frames(await project(), args, cwd);
+    case "render":
+      return (await import("./commands/render")).render(await project(), args, cwd);
+    case "notes":
+      return (await import("./commands/notes")).notes(await project(), args, cwd);
+    case "diff":
+      return (await import("./commands/diff")).diff(await project(), args, cwd);
+    case "check":
+      return (await import("./commands/check")).check(await project(), args);
+    case "probe":
+      return (await import("./commands/check")).probe(await project(), args);
     default:
       throw new CliError(`unknown command "${command}"\n\n${HELP}`);
   }
@@ -52,6 +67,7 @@ const json = process.argv.includes("--json");
 try {
   const result = await main(process.argv.slice(2));
   console.log(json ? JSON.stringify(result.data, null, 1) : result.text);
+  process.exitCode = result.exit ?? 0;
 } catch (e) {
   const known = e instanceof CliError;
   const message = known ? e.message : ((e as Error).stack ?? String(e));

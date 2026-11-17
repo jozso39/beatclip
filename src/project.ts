@@ -16,6 +16,8 @@ export interface Word {
 }
 export interface Line {
   id: string;
+  /** "shout" for a line read from the lyrics file's `shouts` (chanted letters). */
+  kind: "line" | "shout";
   text: string;
   s: number;
   e: number;
@@ -78,16 +80,17 @@ export function loadLines(file: string | undefined): Line[] {
   if (!file) return [];
   if (!existsSync(file)) throw new CliError(`no lyrics file at ${file}`);
   const raw = JSON.parse(readFileSync(file, "utf8"));
-  const line = (l: any, parts: any[], text: (p: any) => string): Line => ({
+  const line = (kind: Line["kind"], l: any, parts: any[], text: (p: any) => string): Line => ({
     id: l.id,
+    kind,
     text: l.text ?? parts.map(text).join(" "),
     s: l.s ?? parts[0]?.s,
     e: l.e ?? parts.at(-1)?.e,
     words: parts.map((p, index) => ({ key: `${l.id}.${index}`, line: l.id, index, w: text(p), s: p.s, e: p.e })),
   });
   const lines = [
-    ...(raw.lines ?? []).map((l: any) => line(l, l.words ?? [], (p) => p.w)),
-    ...(raw.shouts ?? []).map((l: any) => line(l, l.letters ?? [], (p) => p.c)),
+    ...(raw.lines ?? []).map((l: any) => line("line", l, l.words ?? [], (p) => p.w)),
+    ...(raw.shouts ?? []).map((l: any) => line("shout", l, l.letters ?? [], (p) => p.c)),
   ];
   return lines.sort((a, b) => a.s - b.s);
 }
