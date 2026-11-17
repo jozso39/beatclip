@@ -169,6 +169,10 @@ test("arguments that would silently change what runs are refused", async () => {
   expect(await refused("frames", "4", "--half")).toContain("only applies with --beats");
   expect(await refused("render", "--no-encode", "--out", "x.mp4")).toContain("cannot be combined");
   expect(await refused("beat", "--n", "8", "--next")).toContain("need a time");
+  expect(await refused("frames", "--shot", "bounce", "--beats", "--every", "0.5")).toContain("do not apply");
+  expect(await refused("check", "--all", "--update-allow")).toContain("cannot be combined");
+  expect(await refused("probe", "ball", "--from", "3", "--to", "3.1", "--half")).toContain("only applies with");
+  expect(await refused("render", "--excerpt", "--no-encode")).toContain("cannot be combined");
   expect((await cli("at", "12")).json.frame).toBe(359);
 }, 60000);
 
@@ -222,6 +226,12 @@ test("commands running at the same time share the page server and the ledger", a
   utimesSync(resolve(dir, ".beatclip/server.json"), stale, stale);
   expect((await cli("frames", "4")).code).toBe(0);
   expect(bystander.killed).toBe(false);
+  // A source file dated far in the future must not hold a render up.
+  const future = new Date(Date.now() + 3600_000);
+  utimesSync(resolve(dir, "lyrics.json"), future, future);
+  const began = Date.now();
+  expect((await cli("render", "--shot", "intro", "--no-encode")).code).toBe(0);
+  expect(Date.now() - began).toBeLessThan(15000);
   expect(bystander.exitCode).toBeNull();
   bystander.kill();
   expect(await serverUp()).toBe(false);

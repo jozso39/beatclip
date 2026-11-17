@@ -37,23 +37,31 @@ async function ensureServer(cfg: Config): Promise<() => void> {
   });
   try {
     // A record whose process is gone (or whose pid now belongs to something else) is forgotten, never acted on.
-    if (existsSync(serverFile) && !recordAlive(serverFile) && Date.now() - statSync(serverFile).mtimeMs > 5000) rmSync(serverFile, { force: true });
-    if (await reachable(cfg.page.url)) return release;
-    if (!cfg.page.start) throw new CliError(`the page does not answer at ${cfg.page.url} (start its server, or set "page.start" in the config)`);
+    // One written in the last two seconds may belong to a command that is starting the server right now.
+    const forgetDead = () => {
+      if (existsSync(serverFile) && !recordAlive(serverFile) && Date.now() - statSync(serverFile).mtimeMs > 2000) rmSync(serverFile, { force: true });
+    };
     // Only the command that manages to create the record starts the server; the others wait for it.
-    let fd: number | null = null;
-    try {
-      fd = openSync(serverFile, "wx");
-    } catch {}
-    if (fd !== null) {
-      const child = spawn("sh", ["-c", cfg.page.start], { cwd: cfg.root, detached: true, stdio: ["ignore", "ignore", "inherit"] });
+    const start = () => {
+      let fd: number;
+      try {
+        fd = openSync(serverFile, "wx");
+      } catch {
+        return;
+      }
+      const child = spawn("sh", ["-c", cfg.page.start!], { cwd: cfg.root, detached: true, stdio: ["ignore", "ignore", "inherit"] });
       child.unref();
       writeSync(fd, JSON.stringify(identify(child.pid!)));
       closeSync(fd);
-    }
+    };
+    forgetDead();
+    if (await reachable(cfg.page.url)) return release;
+    if (!cfg.page.start) throw new CliError(`the page does not answer at ${cfg.page.url} (start its server, or set "page.start" in the config)`);
     for (let i = 0; i < 150; i++) {
-      if (await reachable(cfg.page.url)) return release;
+      forgetDead();
+      start();
       await Bun.sleep(200);
+      if (await reachable(cfg.page.url)) return release;
     }
     throw new CliError(`"${cfg.page.start}" did not bring up ${cfg.page.url} within 30 s`);
   } catch (e) {

@@ -119,11 +119,8 @@ export function changedSource(before: Map<string, string>, after: Map<string, st
   return null;
 }
 
-/** When a source file last changed (a time in the future, from a wrong clock or an unpacked archive, counts as now). */
-export function lastSourceChange(cfg: Config): number {
-  const times = [cfg.file, ...sourceFiles(cfg)].map((f) => statSync(f).mtimeMs);
-  return Math.min(Date.now(), Math.max(...times));
-}
+/** The newest modification time among the source files and the config. */
+export const lastSourceChange = (cfg: Config) => Math.max(...[cfg.file, ...sourceFiles(cfg)].map((f) => statSync(f).mtimeMs));
 
 interface Facts {
   duration: number;

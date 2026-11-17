@@ -94,7 +94,7 @@ For `check`, each lyric word needs an element that a CSS selector can find from 
 | `page.url`, `page.width`, `page.height` | The page to drive and its frame size. |
 | `page.ready`, `page.seek`, `page.duration` | Hook names; default `__ready`, `__seek`, `__duration`. |
 | `page.shots` | Name of the shot-list hook. Or leave it out and list the shots yourself: `"shots": [{ "id": "intro", "s": 0 }]`. |
-| `page.start` | Command that starts the page's server when the URL does not answer (optional). It is stopped when the last beatclip command using it ends; a server you started yourself is never stopped. |
+| `page.start` | Command that starts the page's server when the URL does not answer (optional). It must stay in the foreground (not `... &` or a daemonising command). It is stopped when the last beatclip command using it ends; a server you started yourself is never stopped. |
 | `page.channel` | Browser channel for playwright-core, default `chrome`. |
 | `fps` | Frames per second of the video, default 60. |
 | `duration` | Length in seconds. Optional: otherwise read from the page hook (and cached with the shot list). |

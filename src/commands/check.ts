@@ -177,6 +177,7 @@ interface Allowed {
 export async function check(p: Project, args: Args): Promise<Result> {
   args.allow(["update-allow", "all"]);
   args.noMore();
+  if (args.has("all") && args.has("update-allow")) throw new CliError("--all and --update-allow cannot be combined");
   const cfg = p.cfg;
   const allowed: Allowed[] = existsSync(cfg.check.allow) ? JSON.parse(readFileSync(cfg.check.allow, "utf8")).allow : [];
   const { words, problems } = await withSession(cfg, async (s) => {
@@ -215,6 +216,7 @@ export async function probe(p: Project, args: Args): Promise<Result> {
   const selector = args.str("selector") ?? probeSelector(args.take("a probe name (or --selector <css>)"));
   const range = args.has("from") || args.has("to");
   if (range && args.rest.length) throw new CliError(`give times or --from/--to, not both (unexpected "${args.rest[0]}")`);
+  if (args.has("half") && !args.has("lowest") && !args.has("highest")) throw new CliError("--half only applies with --lowest or --highest");
   if (!range && (args.has("lowest") || args.has("highest"))) throw new CliError("--lowest and --highest need a range (--from/--to)");
   const times = range ? frameTimes(p, args.time("from") ?? 0, args.time("to") ?? p.duration) : args.rest.map(parseTime);
   if (!times.length) throw new CliError("which times? give times, or --from/--to");

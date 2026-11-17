@@ -27,6 +27,8 @@ export function pickTimes(p: Project, args: Args): { times: number[]; slug: stri
   if (args.has("half") && !args.has("beats")) throw new CliError("--half only applies with --beats");
   if (args.has("window") && !args.has("word")) throw new CliError("--window only applies with --word");
   if (args.has("count") && args.has("every")) throw new CliError("give --count or --every, not both");
+  if (args.has("beats") && (args.has("count") || args.has("every"))) throw new CliError("--beats picks the frames itself; --count and --every do not apply");
+  if (args.has("word") && args.has("count")) throw new CliError("--count does not apply with --word (use --window and --every)");
   const every = args.num("every");
   const count = args.num("count") ?? 12;
   const times: number[] = args.rest.map(parseTime);

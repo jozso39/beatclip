@@ -69,8 +69,22 @@ function lockCache(cfg: Config): () => void {
       // An empty lock is one being written right now, unless it has sat there for a while.
       const text = readFileSync(file, "utf8");
       const fresh = !text && Date.now() - statSync(file).mtimeMs < 5000;
-      if (recordAlive(file) || fresh) throw new CliError(`another beatclip render is using this frame cache${text ? ` (process ${(JSON.parse(text) as ProcessId).pid})` : ""}; wait for it to finish`);
-      rmSync(file, { force: true });
+      const busy = (holder: string) => new CliError(`another beatclip render is using this frame cache${holder ? ` (process ${(JSON.parse(holder) as ProcessId).pid})` : ""}; wait for it to finish`);
+      if (recordAlive(file) || fresh) throw busy(text);
+      // Take the dead lock over by moving it aside: of several renders trying at once, only one rename succeeds.
+      const aside = `${file}.${process.pid}`;
+      try {
+        renameSync(file, aside);
+      } catch {
+        continue;
+      }
+      const moved = readFileSync(aside, "utf8");
+      if (moved !== text) {
+        // Another render had already replaced the dead lock with its own: give it back.
+        renameSync(aside, file);
+        throw busy(moved);
+      }
+      rmSync(aside);
       continue;
     }
     writeSync(fd, JSON.stringify(identify(process.pid)));
@@ -132,22 +146,25 @@ async function shootOnce(session: Session, p: Project, frames: number[], sink: (
   return stop;
 }
 
-/** Waits until no source file has changed for `settleMs`, so the dev server has finished reloading. */
+/**
+ * Waits until the sources have been quiet for `settleMs`, so the dev server has finished reloading.
+ * Quiet is judged by watching them, not by their dates: a file dated in the future must not hold a render up.
+ */
 async function settle(cfg: Config) {
-  if (!cfg.sources.length) return;
-  for (let said = false; ; ) {
-    const age = Date.now() - lastSourceChange(cfg);
-    if (age >= cfg.render.settleMs) return;
-    if (!said) console.error("render: a source file has just changed; waiting for the page to settle");
-    said = true;
-    await Bun.sleep(cfg.render.settleMs - age + 50);
+  if (!cfg.sources.length || Date.now() - lastSourceChange(cfg) >= cfg.render.settleMs) return;
+  console.error("render: a source file has just changed; waiting for the page to settle");
+  let seen = sourceStamp(cfg);
+  for (let quietSince = Date.now(); Date.now() - quietSince < cfg.render.settleMs; ) {
+    await Bun.sleep(100);
+    const now = sourceStamp(cfg);
+    if (now !== seen) [seen, quietSince] = [now, Date.now()];
   }
 }
 
-const ATTEMPTS = 4;
-
 /** A value that changes whenever a source file is added, removed or modified in any way. */
 const sourceStamp = (cfg: Config) => JSON.stringify([...snapshotSources(cfg)]);
+
+const ATTEMPTS = 4;
 
 /**
  * Shoots frames, starting over (all of them) whenever the page changed underneath.
@@ -408,6 +425,7 @@ const secs = (ms: number) => Math.round(ms / 100) / 10;
 export async function render(p: Project, args: Args, cwd: string): Promise<Result> {
   args.allow(["notes", "full", "out", "no-encode", "no-verify", "no-widen", "excerpt"], ["from", "to", "shot", "note"]);
   args.noMore();
+  if (args.has("excerpt") && args.has("no-encode")) throw new CliError("--excerpt and --no-encode cannot be combined");
   if (args.has("out") && (args.has("no-encode") || args.has("excerpt"))) throw new CliError("--out cannot be combined with --no-encode or --excerpt (an excerpt gets its own name next to the videos)");
   const cfg = p.cfg;
   const total = frameCount(p);
