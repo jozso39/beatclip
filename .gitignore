@@ -1,0 +1,7 @@
+node_modules/
+out/
+.beatclip/
+demo/audio/
+demo/beatclip.notes.json
+*.log
+.DS_Store

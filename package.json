@@ -1,0 +1,20 @@
+{
+  "name": "beatclip",
+  "version": "0.1.0",
+  "description": "Edit code-rendered music videos from timestamped notes: time lookups, contact sheets, partial renders, a notes ledger, draft diffs and sync checks.",
+  "type": "module",
+  "license": "MIT",
+  "bin": { "beatclip": "src/cli.ts" },
+  "scripts": {
+    "test": "bun test",
+    "demo": "bun demo/serve.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "playwright-core": "^1.65.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}

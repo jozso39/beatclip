@@ -1,0 +1,12 @@
+{
+  "lines": [
+    { "id": "a1", "text": "red square rolls right", "s": 0.5, "e": 2.5, "words": [
+      { "w": "red", "s": 0.5, "e": 1.0 }, { "w": "square", "s": 1.0, "e": 1.5 }, { "w": "rolls", "s": 1.5, "e": 2.0 }, { "w": "right", "s": 2.0, "e": 2.5 } ] },
+    { "id": "a2", "text": "blue ball bounces high", "s": 3.5, "e": 5.5, "words": [
+      { "w": "blue", "s": 3.5, "e": 4.0 }, { "w": "ball", "s": 4.0, "e": 4.5 }, { "w": "bounces", "s": 4.5, "e": 5.0 }, { "w": "high", "s": 5.0, "e": 5.5 } ] },
+    { "id": "a3", "text": "green bar grows wide", "s": 6.5, "e": 8.5, "words": [
+      { "w": "green", "s": 6.5, "e": 7.0 }, { "w": "bar", "s": 7.0, "e": 7.5 }, { "w": "grows", "s": 7.5, "e": 8.0 }, { "w": "wide", "s": 8.0, "e": 8.5 } ] },
+    { "id": "a4", "text": "all shapes dance now", "s": 9.5, "e": 11.5, "words": [
+      { "w": "all", "s": 9.5, "e": 10.0 }, { "w": "shapes", "s": 10.0, "e": 10.5 }, { "w": "dance", "s": 10.5, "e": 11.0 }, { "w": "now", "s": 11.0, "e": 11.5 } ] }
+  ]
+}

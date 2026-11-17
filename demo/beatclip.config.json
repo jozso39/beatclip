@@ -1,0 +1,28 @@
+{
+  "page": {
+    "url": "http://localhost:5210/index.html?render=1",
+    "width": 640,
+    "height": 360,
+    "shots": "__shots",
+    "start": "bun serve.ts 5210"
+  },
+  "fps": 30,
+  "audio": "audio/click.wav",
+  "lyrics": "lyrics.json",
+  "sources": ["scene.js", "index.html", "lyrics.json"],
+  "cues": [
+    { "name": "ball first lands", "t": 3.5 },
+    { "name": "bar full", "t": 8.5 }
+  ],
+  "beats": { "first": 0.5, "interval": 0.5, "perBar": 4 },
+  "out": { "dir": "out", "video": "out/demo-{n}.mp4" },
+  "render": { "workers": 4 },
+  "check": {
+    "selector": ".lw[data-word=\"{line}:{word}\"]",
+    "allow": "beatclip.allow.json",
+    "probes": [
+      { "probe": "ball", "assert": "lowest-on-beat", "from": 3, "to": 6 },
+      { "probe": "ball", "assert": "no-overlap", "with": "words", "from": 3, "to": 6 }
+    ]
+  }
+}

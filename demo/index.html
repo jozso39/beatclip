@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>beatclip demo</title>
+    <style>
+      body { margin: 0; background: #16161d; overflow: hidden; }
+      #stage { position: relative; width: 640px; height: 360px; overflow: hidden; background: #16161d; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <script type="module">
+      import { build, DURATION, SHOTS } from "./scene.js";
+      const lyrics = await (await fetch("./lyrics.json")).json();
+      const draw = build(document.getElementById("stage"), lyrics);
+      // The hooks beatclip drives: seek to a time, the duration, the shot list, and a ready flag set last.
+      window.__seek = (t) => draw(t);
+      window.__duration = DURATION;
+      window.__shots = SHOTS;
+      draw(0);
+      if (!new URLSearchParams(location.search).has("render")) {
+        // Opened by a person: play in a loop.
+        const start = performance.now();
+        const loop = (now) => (draw(((now - start) / 1000) % DURATION), requestAnimationFrame(loop));
+        requestAnimationFrame(loop);
+      }
+      window.__ready = true;
+    </script>
+  </body>
+</html>
