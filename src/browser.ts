@@ -1,6 +1,8 @@
 import { chromium, type Browser, type Page } from "playwright-core";
-import { rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Config } from "./config";
+import { atExit, processAlive } from "./exit";
 import { scalePicture } from "./ffmpeg";
 import { CliError } from "./time";
 
@@ -13,17 +15,45 @@ async function reachable(url: string): Promise<boolean> {
   }
 }
 
-/** Makes sure the page answers; starts `page.start` when it does not. Returns a function that stops what it started. */
+/**
+ * Makes sure the page answers, starting `page.start` when it does not, and returns the function that lets go of it.
+ * Several commands may use one started server at the same time: each registers itself, and the server is stopped
+ * by whichever command finishes last. A server beatclip did not start is never stopped.
+ */
 async function ensureServer(cfg: Config): Promise<() => void> {
-  if (await reachable(cfg.page.url)) return () => {};
-  if (!cfg.page.start) throw new CliError(`the page does not answer at ${cfg.page.url} (start its server, or set "page.start" in the config)`);
-  const proc = Bun.spawn(["sh", "-c", cfg.page.start], { cwd: cfg.root, stdout: "ignore", stderr: "inherit" });
-  for (let i = 0; i < 150; i++) {
-    if (await reachable(cfg.page.url)) return () => proc.kill();
-    await Bun.sleep(200);
+  const users = resolve(cfg.root, ".beatclip", "users");
+  const serverFile = resolve(cfg.root, ".beatclip", "server.json");
+  const me = resolve(users, String(process.pid));
+  mkdirSync(users, { recursive: true });
+  writeFileSync(me, "");
+  const release = atExit(() => {
+    rmSync(me, { force: true });
+    for (const pid of readdirSync(users)) if (!processAlive(Number(pid))) rmSync(resolve(users, pid), { force: true });
+    if (!existsSync(serverFile) || readdirSync(users).length) return;
+    try {
+      process.kill(JSON.parse(readFileSync(serverFile, "utf8")).pid);
+    } catch {}
+    rmSync(serverFile, { force: true });
+  });
+  try {
+    if (await reachable(cfg.page.url)) return release;
+    if (!cfg.page.start) throw new CliError(`the page does not answer at ${cfg.page.url} (start its server, or set "page.start" in the config)`);
+    // A server file left by a command that died: its server is gone, or the page would answer.
+    if (existsSync(serverFile) && !processAlive(JSON.parse(readFileSync(serverFile, "utf8")).pid)) rmSync(serverFile, { force: true });
+    if (!existsSync(serverFile)) {
+      const proc = Bun.spawn(["sh", "-c", cfg.page.start], { cwd: cfg.root, stdout: "ignore", stderr: "inherit" });
+      proc.unref();
+      writeFileSync(serverFile, JSON.stringify({ pid: proc.pid }));
+    }
+    for (let i = 0; i < 150; i++) {
+      if (await reachable(cfg.page.url)) return release;
+      await Bun.sleep(200);
+    }
+    throw new CliError(`"${cfg.page.start}" did not bring up ${cfg.page.url} within 30 s`);
+  } catch (e) {
+    release();
+    throw e;
   }
-  proc.kill();
-  throw new CliError(`"${cfg.page.start}" did not bring up ${cfg.page.url} within 30 s`);
 }
 
 export interface Session {
@@ -88,14 +118,19 @@ export const seek = (page: Page, cfg: Config, t: number) =>
 /** Reads a hook's value from the page (duration, shot list). */
 export const readHook = <T>(page: Page, name: string) => page.evaluate((n) => (window as any)[n], name) as Promise<T>;
 
+/** Draws time `t` and returns the page's picture as a JPEG at the render quality. */
+export async function shootJpeg(page: Page, cfg: Config, t: number): Promise<Buffer> {
+  await seek(page, cfg, t);
+  return page.screenshot({ type: "jpeg", quality: cfg.render.quality });
+}
+
 /**
  * Saves the page's picture of time `t` as a JPEG `width` pixels wide. The page (opened at the render scale) is shot
  * at full size and scaled afterwards: a page drawn small renders text differently from a scaled-down video frame.
  */
 export async function shootPicture(page: Page, cfg: Config, t: number, width: number, out: string): Promise<void> {
-  await seek(page, cfg, t);
   const full = out.replace(/\.jpg$/, ".full.jpg");
-  await page.screenshot({ path: full, type: "jpeg", quality: cfg.render.quality });
+  writeFileSync(full, await shootJpeg(page, cfg, t));
   await scalePicture(full, width, out);
   rmSync(full);
 }

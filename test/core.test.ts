@@ -93,6 +93,7 @@ group("lookups on the demo project", () => {
     expect(m.cue).toEqual({ name: "ball first lands", t: 3.5, delta: 0.7 });
     expect(m.beat).toEqual({ index: 7, phase: 0.4, bar: 2, inBar: 4, nearest: { n: 7, t: 4, delta: 0.2 } });
     expect(m.frame).toBe(126);
+    expect(describe(p, 11.99).frame).toBe(359);
   });
   test("between two lines it names the last and the next word", () => {
     const m = describe(p, 3);
@@ -109,6 +110,8 @@ group("lookups on the demo project", () => {
     expect(hits("finale")).toEqual(["shot:finale@9"]);
     expect(hits("a4")).toEqual(["line:a4@9.5"]);
     expect(hits("zebra")).toEqual([]);
+    const hyphen = { ...p, shots: [{ id: "verse-1", s: 0, e: 6 }, { id: "verse_2", s: 6, e: 12 }] };
+    expect((find(hyphen, new Args(["verse-1"])).data as { id: string }[]).map((h) => h.id)).toEqual(["verse-1"]);
   });
   test("beat: nearest, next, previous, half beats and offsets", () => {
     const at = (...argv: string[]) => (beat(p, new Args(argv)).data as { n: number; t: number });

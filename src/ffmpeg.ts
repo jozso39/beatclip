@@ -8,10 +8,10 @@ export interface Ran {
 }
 
 /** Runs a program to the end and returns what it printed. A missing program is a CliError. */
-export async function run(cmd: string[], opts: { cwd?: string } = {}): Promise<Ran> {
+export async function run(cmd: string[]): Promise<Ran> {
   let proc;
   try {
-    proc = Bun.spawn(cmd, { cwd: opts.cwd, stdout: "pipe", stderr: "pipe" });
+    proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
   } catch {
     throw new CliError(`cannot run "${cmd[0]}": is it installed and on PATH?`);
   }
@@ -49,12 +49,6 @@ export async function probeVideo(file: string): Promise<VideoInfo> {
   return { width: st.width, height: st.height, fps, duration, frames: Number(st.nb_frames) || Math.round(duration * fps) };
 }
 
-export async function probeDuration(file: string): Promise<number> {
-  if (!existsSync(file)) throw new CliError(`no such file: ${file}`);
-  const r = await must(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], `reading ${file}`);
-  return Number(r.stdout.trim());
-}
-
 /** Writes the frame shown at time `t` of a video as a JPEG scaled to `width`. */
 export async function grabFrame(video: string, info: VideoInfo, t: number, width: number, out: string): Promise<void> {
   const frame = Math.round(t * info.fps);
@@ -77,10 +71,10 @@ export async function scalePicture(src: string, width: number, out: string): Pro
  */
 function differenceFilter(aspect: number): string {
   const size = `scale=480:${Math.round(480 / aspect / 8) * 8}`;
-  return `[0:v]${size},format=gbrp[a];[1:v]${size},format=gbrp[b];[a][b]blend=all_mode=difference,format=gray,scale=iw/8:ih/8:flags=area,signalstats,metadata=print:key=lavfi.signalstats.YMAX:file=-`;
+  return `[0:v]${size},format=gbrp[a];[1:v]${size},format=gbrp[b];[a][b]blend=all_mode=difference:shortest=1,format=gray,scale=iw/8:ih/8:flags=area,signalstats,metadata=print:key=lavfi.signalstats.YMAX:file=-`;
 }
 
-/** Difference of every frame of two videos (or of two pictures: one value). `aspect` is width / height. */
+/** Difference of every frame of two videos, up to the end of the shorter one (or of two pictures: one value). `aspect` is width / height. */
 export async function differences(a: string, b: string, aspect: number): Promise<number[]> {
   const r = await must(["ffmpeg", "-loglevel", "error", "-i", a, "-i", b, "-lavfi", differenceFilter(aspect), "-f", "null", "-"], `comparing ${a} with ${b}`);
   const values = [...r.stdout.matchAll(/YMAX=([\d.]+)/g)].map((m) => Number(m[1]));

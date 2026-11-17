@@ -1,15 +1,16 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, openSync, closeSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import type { Page } from "playwright-core";
 import type { Args } from "../args";
-import { openSession, seek, type Session } from "../browser";
+import { openSession, shootJpeg, type Session } from "../browser";
 import type { Config } from "../config";
 import { difference, must, pool } from "../ffmpeg";
-import { newestSource, shotAt, shotById, type Project } from "../project";
-import { CliError, fmtTime, parseTime, round3 } from "../time";
+import { atExit, processAlive } from "../exit";
+import { frameCount, newestSource, shotAt, shotById, type Project } from "../project";
+import { CliError, fmtSpan, fmtTime, parseTime, round3 } from "../time";
 import type { Result } from "./lookup";
-import { loadNotes, noteRange, pendingNotes } from "./notes";
+import { loadNotes, noteById, noteRange, pendingNotes } from "./notes";
 
 /** A run of frames: first frame and the frame after the last. */
 export type Range = [number, number];
@@ -34,10 +35,11 @@ const manifestPath = (cfg: Config) => resolve(cfg.out.cache, "manifest.json");
 interface Manifest {
   /** What the cached frames were shot with; a change of any of these makes the cache useless. */
   params: { url: string; fps: number; width: number; height: number; scale: number; quality: number; frames: number };
-  /** True once every frame has been shot with these params. */
+  /** False while a full render is under way: until it finishes, the cache may hold frames of several versions or none. */
   complete: boolean;
   /** Ranges whose re-shoot was started but not finished and checked. */
   dirty: Range[];
+  /** When the manifest was last written (for people looking at the file). */
   updated: string;
 }
 
@@ -49,17 +51,43 @@ function writeManifest(cfg: Config, m: Omit<Manifest, "updated">) {
   writeFileSync(manifestPath(cfg), JSON.stringify({ ...m, updated: new Date().toISOString() }));
 }
 
+/** Numbers of the frames in the cache folder. */
+const cachedFrames = (cfg: Config) => readdirSync(cfg.out.cache).filter((f) => /^\d+\.jpg$/.test(f)).map((f) => parseInt(f));
+
+/**
+ * Only one render may write a project's frame cache at a time. Returns the function that gives the lock back.
+ * A lock left by a render that died is taken over.
+ */
+function lockCache(cfg: Config): () => void {
+  const file = resolve(cfg.out.cache, ".lock");
+  mkdirSync(cfg.out.cache, { recursive: true });
+  for (let tries = 0; tries < 2; tries++) {
+    try {
+      closeSync(openSync(file, "wx"));
+      writeFileSync(file, String(process.pid));
+      return atExit(() => rmSync(file, { force: true }));
+    } catch {
+      const owner = Number(readFileSync(file, "utf8"));
+      if (owner && processAlive(owner)) throw new CliError(`another beatclip render is using this frame cache (process ${owner}); wait for it to finish`);
+      rmSync(file, { force: true });
+    }
+  }
+  throw new CliError(`cannot lock the frame cache at ${file}`);
+}
+
 /** Why a partial render cannot use the cache, or null when it can. */
 function cacheProblem(cfg: Config, m: Manifest | null, params: Manifest["params"]): string | null {
   if (!m) return "there is no frame cache yet";
   if (!m.complete) return "the frame cache is incomplete (the last full render did not finish)";
   const changed = (Object.keys(params) as (keyof Manifest["params"])[]).find((k) => m.params[k] !== params[k]);
   if (changed) return `the frame cache was shot with another ${changed} (${m.params[changed]}, now ${params[changed]})`;
-  const have = readdirSync(cfg.out.cache).filter((f) => f.endsWith(".jpg")).length;
-  return have === params.frames ? null : `the frame cache holds ${have} frames, the video has ${params.frames}`;
+  const have = cachedFrames(cfg).filter((f) => f < params.frames).length;
+  return have === params.frames ? null : `the frame cache holds ${have} of the video's ${params.frames} frames`;
 }
 
-const RELOAD = /Execution context was destroyed|navigat|has been closed|frame was detached|Target closed/i;
+/** Errors a page throws when it reloaded under us. A server that stopped answering (net::ERR_...) is not one of them. */
+const RELOAD = /Execution context was destroyed|because of a navigation|frame was detached|Target closed|has been closed/i;
+const isReload = (e: unknown) => RELOAD.test((e as Error).message) && !/net::ERR_/.test((e as Error).message);
 
 /**
  * Shoots the given frames with a pool of pages. Returns null when all were shot from one unchanged page,
@@ -81,14 +109,13 @@ async function shootOnce(session: Session, p: Project, frames: number[], sink: (
         });
         while (!stop && next < frames.length) {
           const frame = frames[next++];
-          await seek(page, cfg, frame / p.fps);
-          const jpeg = await page.screenshot({ type: "jpeg", quality: cfg.render.quality });
+          const jpeg = await shootJpeg(page, cfg, frame / p.fps);
           if (stop) break;
           await sink(frame, jpeg);
           tick();
         }
       } catch (e) {
-        if (!stop && !RELOAD.test((e as Error).message)) throw e;
+        if (!stop && !isReload(e)) throw e;
         stop ??= "the page reloaded";
       } finally {
         await page?.context().close().catch(() => {});
@@ -112,11 +139,20 @@ async function settle(cfg: Config) {
   }
 }
 
-/** Shoots frames, starting over (all of them) whenever the page changed underneath. Returns how many times it had to start over. */
-async function shoot(session: Session, p: Project, frames: number[], sink: (frame: number, jpeg: Buffer) => Promise<unknown>, label: string): Promise<number> {
-  if (!frames.length) return 0;
-  for (let attempt = 1; attempt <= 4; attempt++) {
+const ATTEMPTS = 4;
+
+/** Changes whenever a source file does (0 when the config names no sources). */
+const sourceStamp = (cfg: Config) => (cfg.sources.length ? newestSource(cfg).mtime : 0);
+
+/**
+ * Shoots frames, starting over (all of them) whenever the page changed underneath.
+ * Returns how many times it had to start over and the source stamp all the frames were shot at.
+ */
+async function shoot(session: Session, p: Project, frames: number[], sink: (frame: number, jpeg: Buffer) => Promise<unknown>, label: string): Promise<{ restarts: number; stamp: number }> {
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     await settle(p.cfg);
+    const stamp = sourceStamp(p.cfg);
+    if (!frames.length) return { restarts: 0, stamp };
     const started = Date.now();
     let done = 0;
     let said = started;
@@ -127,10 +163,10 @@ async function shoot(session: Session, p: Project, frames: number[], sink: (fram
       const secs = (said - started) / 1000;
       console.error(`${label}: ${done}/${frames.length} frames, ${secs.toFixed(0)} s, ${(done / secs).toFixed(1)} frames/s`);
     });
-    if (!reason) return attempt - 1;
-    console.error(`${label}: ${reason}; waiting for it to settle and shooting these ${frames.length} frames again (attempt ${attempt + 1})`);
+    if (!reason) return { restarts: attempt - 1, stamp };
+    console.error(`${label}: ${reason}${attempt < ATTEMPTS ? `; waiting for it to settle and shooting these ${frames.length} frames again (attempt ${attempt + 1} of ${ATTEMPTS})` : ""}`);
   }
-  throw new CliError(`${label}: the page kept changing during 4 attempts; render again when the edits are done`);
+  throw new CliError(`${label}: the page kept changing during ${ATTEMPTS} attempts; render again when the edits are done`);
 }
 
 /** Frames outside the re-shot ranges to check against the cache: next to each edge, the middle of every shot, and a spread over the rest. */
@@ -177,8 +213,7 @@ async function reproducesCache(page: Page, p: Project, frame: number, differs: (
   const paths = [[frame - 3 * step, frame - 2 * step, frame - step], [0], [frame - 1], [frame + 5 * p.fps]];
   for (const path of paths) {
     for (const f of [...path, frame]) {
-      await seek(page, p.cfg, Math.max(0, f) / p.fps);
-      const jpeg = await page.screenshot({ type: "jpeg", quality: p.cfg.render.quality });
+      const jpeg = await shootJpeg(page, p.cfg, Math.min(Math.max(0, f), frameCount(p) - 1) / p.fps);
       if (f === frame && (await differs(jpeg)) < p.cfg.render.differs) return true;
     }
   }
@@ -249,132 +284,191 @@ async function encode(p: Project, out: string, first: number, count: number) {
 }
 
 /** The ranges asked for on the command line, in frames: --from/--to pairs, --shot, --note, --notes. */
-function requestedRanges(p: Project, args: Args, total: number): Range[] {
+function requestedRanges(p: Project, args: Args): Range[] {
   const seconds: [number, number][] = [];
   const froms = args.all("from").map(parseTime), tos = args.all("to").map(parseTime);
   for (let i = 0; i < Math.max(froms.length, tos.length); i++) seconds.push([froms[i] ?? 0, tos[i] ?? p.duration]);
   for (const id of args.all("shot")) seconds.push([shotById(p, id).s, shotById(p, id).e]);
   const notes = loadNotes(p.cfg);
-  for (const id of args.all("note")) {
-    const note = notes.find((n) => n.id === Number(id));
-    if (!note) throw new CliError(`no note ${id}`);
-    seconds.push(noteRange(p, note));
-  }
+  for (const id of args.all("note")) seconds.push(noteRange(p, noteById(notes, id)));
   if (args.has("notes")) {
     const pending = pendingNotes(notes);
     if (!pending.length) throw new CliError("--notes: no open or done notes in the ledger; nothing to render");
     seconds.push(...pending.map((n) => noteRange(p, n)));
   }
-  for (const [a, b] of seconds) if (!(b > a)) throw new CliError(`the range ${fmtTime(a)}–${fmtTime(b)} is empty`);
-  return mergeRanges(seconds.map(([a, b]) => [Math.max(0, Math.floor(a * p.fps)), Math.min(total, Math.ceil(b * p.fps))]));
+  for (const [a, b] of seconds) {
+    if (!(b > a)) throw new CliError(`the range ${fmtSpan(a, b)} is empty`);
+    if (a >= p.duration) throw new CliError(`the range ${fmtSpan(a, b)} starts past the end of the video (${fmtTime(p.duration)})`);
+  }
+  return mergeRanges(seconds.map(([a, b]) => [Math.max(0, Math.floor(a * p.fps)), Math.min(frameCount(p), Math.ceil(b * p.fps))]));
+}
+
+/** The output pattern, checked before any frame is shot: a fixed name that already exists is never overwritten. */
+function outputPattern(p: Project, args: Args, cwd: string): string | null {
+  if (args.has("no-encode")) return null;
+  const pattern = args.str("out") ? resolve(cwd, args.str("out")!) : p.cfg.out.video;
+  if (!pattern.includes("{n}") && existsSync(pattern)) throw new CliError(`${pattern} already exists; choose another --out, or put {n} in the name to number the drafts`);
+  if (p.cfg.audio && !existsSync(p.cfg.audio)) throw new CliError(`no audio file at ${p.cfg.audio}`);
+  return pattern;
+}
+
+interface Shooting {
+  /** What ended up re-shot (the whole video for a full render). */
+  ranges: Range[];
+  /** Why everything was shot although ranges were asked for, if so. */
+  fullBecause: string | null;
+  checks: Checked[];
+  /** Screenshots taken into the cache, counting frames shot again. */
+  shot: number;
+  restarts: number;
+  ms: { screenshots: number; check: number };
+}
+
+const spans = (p: Project, rs: Range[]) => rs.map(([a, b]) => fmtSpan(a / p.fps, b / p.fps)).join(", ");
+const listed = (ds: Differing[]) => ds.map((d) => `${d.time} (${d.shot ?? "no shot"}, diff ${d.diff.toFixed(1)})`).join(", ");
+
+/**
+ * Brings the cache up to date for the given ranges: shoots them, checks frames outside them against the cache,
+ * widens by whole shots where the cache turned out stale, and shoots everything when that is not enough.
+ * If a source file changes at any point, all ranges shot so far are shot again, so the cache never keeps
+ * frames of two versions of the page.
+ */
+async function shootChecked(session: Session, p: Project, start: Range[], fullBecause: string | null, opts: { verify: boolean; widen: boolean }): Promise<Shooting> {
+  const cfg = p.cfg;
+  const total = frameCount(p);
+  const everything: Range[] = [[0, total]];
+  const params = { url: cfg.page.url, fps: p.fps, width: cfg.page.width, height: cfg.page.height, scale: cfg.render.scale, quality: cfg.render.quality, frames: total };
+  const store = (f: number, jpeg: Buffer) => Bun.write(framePath(cfg, f), jpeg);
+  const out: Shooting = { ranges: start, fullBecause, checks: [], shot: 0, restarts: 0, ms: { screenshots: 0, check: 0 } };
+  const save = (done: boolean) => writeManifest(cfg, { params, complete: !(sizeOf(out.ranges) === total && !done), dirty: done || sizeOf(out.ranges) === total ? [] : out.ranges });
+
+  save(false);
+  // The source stamp every frame of `out.ranges` in the cache was shot at; null until the first shoot.
+  let stamp: number | null = null;
+  let todo = framesOf(out.ranges);
+  for (let widenings = 0, redone = 0; ; ) {
+    const started = Date.now();
+    const shot = await shoot(session, p, todo, store, "render");
+    out.restarts += shot.restarts;
+    out.shot += todo.length;
+    out.ms.screenshots += Date.now() - started;
+    // The first shoot (and a re-shoot of everything) sets the stamp; frames added by widening must have the same one.
+    stamp ??= shot.stamp;
+
+    let result: Checked | null = null;
+    if (shot.stamp === stamp && sizeOf(out.ranges) < total && opts.verify) {
+      const checkStarted = Date.now();
+      result = await verify(session, p, out.ranges, total);
+      out.ms.check += Date.now() - checkStarted;
+    }
+    // A source changed since the ranges were shot: part of them is the old version. Shoot them all again.
+    if (sourceStamp(cfg) !== stamp) {
+      if (++redone >= ATTEMPTS) throw new CliError(`render: the sources kept changing during ${ATTEMPTS} attempts; render again when the edits are done`);
+      console.error(`render: a source file changed while rendering; shooting ${spans(p, out.ranges)} again`);
+      out.restarts++;
+      stamp = null;
+      todo = framesOf(out.ranges);
+      continue;
+    }
+    if (!result) break;
+    out.checks.push(result);
+    if (result.unstable.length) console.error(`check: ${result.unstable.length} sampled frames paint differently depending on what was drawn before (not a stale cache): ${listed(result.unstable)}`);
+    if (!result.differing.length) break;
+    console.error(`check: ${result.differing.length} of ${result.samples} frames outside ${spans(p, out.ranges)} no longer match the cache: ${listed(result.differing)}`);
+    if (!opts.widen) throw new CliError(`frames outside the rendered range changed too (${listed(result.differing)}); render those ranges as well, or drop --no-widen`);
+
+    const widened = mergeRanges([...out.ranges, ...result.differing.map((d): Range => {
+      const s = shotAt(p, d.t);
+      return s ? [Math.floor(s.s * p.fps), Math.min(total, Math.ceil(s.e * p.fps))] : [0, total];
+    })]);
+    const next = ++widenings > 2 || sizeOf(widened) > 0.6 * total ? everything : widened;
+    if (next === everything) out.fullBecause = `frames outside the ranges kept differing from the cache (${listed(result.differing)})`;
+    console.error(next === everything ? "check: falling back to a full render" : `check: widening to ${spans(p, next)}`);
+    todo = framesOf(next).filter((f) => !inRanges(out.ranges, f));
+    out.ranges = next;
+    save(false);
+  }
+  // After a full shoot, frames past the end (the video got shorter) must not linger in the cache.
+  if (sizeOf(out.ranges) === total) for (const f of cachedFrames(cfg)) if (f >= total) rmSync(framePath(cfg, f));
+  save(true);
+  return out;
 }
 
 const secs = (ms: number) => Math.round(ms / 100) / 10;
 
 /**
  * Full render, or a partial one that re-shoots only some ranges into the persistent frame cache
- * and encodes the whole video from the cache. After a partial shoot, frames outside the ranges
- * are sampled and compared with the cache; where they differ the ranges are widened by whole shots,
- * and if that is not enough everything is shot again.
+ * and encodes the whole video (or with --excerpt only that stretch) from the cache.
  */
 export async function render(p: Project, args: Args, cwd: string): Promise<Result> {
+  args.allow(["notes", "full", "out", "no-encode", "no-verify", "no-widen", "excerpt"], ["from", "to", "shot", "note"]);
+  args.noMore();
   const cfg = p.cfg;
-  const total = Math.floor(p.duration * p.fps);
-  const params = { url: cfg.page.url, fps: p.fps, width: cfg.page.width, height: cfg.page.height, scale: cfg.render.scale, quality: cfg.render.quality, frames: total };
-  const everything: Range[] = [[0, total]];
-  const asked = requestedRanges(p, args, total);
-  const before = readManifest(cfg);
-  let fullBecause: string | null = args.has("full") || !asked.length ? "a full render was asked for" : cacheProblem(cfg, before, params);
-  if (fullBecause && asked.length && !args.has("full")) console.error(`render: ${fullBecause}; doing a full render instead of the partial one`);
-
-  let ranges = fullBecause ? everything : mergeRanges([...asked, ...(before?.dirty ?? [])]);
-  const spans = (rs: Range[]) => rs.map(([a, b]) => `${fmtTime(a / p.fps)}–${fmtTime(b / p.fps)}`).join(", ");
-  const store = (f: number, jpeg: Buffer) => Bun.write(framePath(cfg, f), jpeg);
-  const timings = { screenshots: 0, check: 0, encode: 0 };
-  const checks: Checked[] = [];
-  let shot = 0, restarts = 0;
+  const total = frameCount(p);
+  const asked = requestedRanges(p, args);
+  const pattern = outputPattern(p, args, cwd);
   const t0 = Date.now();
-
-  mkdirSync(cfg.out.cache, { recursive: true });
-  writeManifest(cfg, fullBecause ? { params, complete: false, dirty: [] } : { params, complete: true, dirty: ranges });
-  const session = await openSession(cfg);
-  try {
-    let todo = framesOf(ranges);
-    for (let round = 0; ; round++) {
-      const started = Date.now();
-      restarts += await shoot(session, p, todo, store, "render");
-      shot += todo.length;
-      timings.screenshots += Date.now() - started;
-      if (sizeOf(ranges) === total || args.has("no-verify")) break;
-
-      const checkStarted = Date.now();
-      const result = await verify(session, p, ranges, total);
-      timings.check += Date.now() - checkStarted;
-      checks.push(result);
-      if (result.unstable.length)
-        console.error(`check: ${result.unstable.length} sampled frames paint differently depending on what was drawn before (not a stale cache): ${result.unstable.map((d) => `${d.time} (${d.shot ?? "no shot"}, diff ${d.diff.toFixed(1)})`).join(", ")}`);
-      if (!result.differing.length) break;
-      const where = result.differing.map((d) => `${d.time} (${d.shot ?? "no shot"}, diff ${d.diff.toFixed(1)})`).join(", ");
-      console.error(`check: ${result.differing.length} of ${result.samples} frames outside ${spans(ranges)} no longer match the cache: ${where}`);
-      if (args.has("no-widen")) throw new CliError(`frames outside the rendered range changed too (${where}); render those ranges as well, or drop --no-widen`);
-
-      const widened = mergeRanges([...ranges, ...result.differing.map((d): Range => {
-        const s = shotAt(p, d.t);
-        return s ? [Math.floor(s.s * p.fps), Math.min(total, Math.ceil(s.e * p.fps))] : [0, total];
-      })]);
-      const next = round >= 2 || sizeOf(widened) > 0.6 * total ? everything : widened;
-      if (next === everything) fullBecause = `frames outside the ranges kept differing from the cache (${where})`;
-      console.error(next === everything ? "check: falling back to a full render" : `check: widening to ${spans(next)}`);
-      todo = framesOf(next).filter((f) => !inRanges(ranges, f));
-      ranges = next;
-      writeManifest(cfg, { params, complete: true, dirty: ranges });
-    }
-    writeManifest(cfg, { params, complete: true, dirty: [] });
-  } finally {
-    await session.close();
-  }
-
-  // --excerpt encodes only the rendered stretch (a quick look) instead of the whole video.
-  const excerpt = args.has("excerpt") && ranges.length === 1 && sizeOf(ranges) < total;
-  if (args.has("excerpt") && !excerpt) console.error("render: --excerpt needs one partial range; encoding the whole video");
+  const unlock = lockCache(cfg);
+  let done: Shooting;
   let out: string | null = null;
-  if (!args.has("no-encode")) {
-    const started = Date.now();
-    const [a, b] = excerpt ? ranges[0] : [0, total];
-    const pattern = args.str("out") ? resolve(cwd, args.str("out")!) : cfg.out.video;
-    out = videoPath(excerpt ? resolve(dirname(pattern), `excerpt-${(a / p.fps).toFixed(2)}-${(b / p.fps).toFixed(2)}-{n}.mp4`) : pattern);
-    await encode(p, out, a, b - a);
-    timings.encode = Date.now() - started;
+  let encodeMs = 0;
+  let excerpt = false;
+  try {
+    const before = readManifest(cfg);
+    const params = { url: cfg.page.url, fps: p.fps, width: cfg.page.width, height: cfg.page.height, scale: cfg.render.scale, quality: cfg.render.quality, frames: total };
+    const fullBecause = args.has("full") || !asked.length ? "a full render was asked for" : cacheProblem(cfg, before, params);
+    if (fullBecause && asked.length && !args.has("full")) console.error(`render: ${fullBecause}; doing a full render instead of the partial one`);
+    const session = await openSession(cfg);
+    try {
+      const start: Range[] = fullBecause ? [[0, total]] : mergeRanges([...asked, ...(before?.dirty ?? [])]);
+      done = await shootChecked(session, p, start, fullBecause, { verify: !args.has("no-verify"), widen: !args.has("no-widen") });
+    } finally {
+      await session.close();
+    }
+    // --excerpt encodes only the rendered stretch (a quick look) instead of the whole video.
+    excerpt = args.has("excerpt") && done.ranges.length === 1 && sizeOf(done.ranges) < total;
+    if (args.has("excerpt") && !excerpt) console.error("render: --excerpt needs one partial range; encoding the whole video");
+    if (pattern) {
+      const started = Date.now();
+      const [a, b] = excerpt ? done.ranges[0] : [0, total];
+      out = videoPath(excerpt ? resolve(dirname(pattern), `excerpt-${(a / p.fps).toFixed(2)}-${(b / p.fps).toFixed(2)}-{n}.mp4`) : pattern);
+      await encode(p, out, a, b - a);
+      encodeMs = Date.now() - started;
+    }
+  } finally {
+    unlock();
   }
 
+  const { ranges, checks, shot, restarts } = done;
   const full = sizeOf(ranges) === total;
   const differing = checks.flatMap((c) => c.differing);
   const unstable = checks.flatMap((c) => c.unstable);
+  const seconds = { screenshots: secs(done.ms.screenshots), check: secs(done.ms.check), encode: secs(encodeMs), total: secs(Date.now() - t0) };
+  const asSeconds = (rs: Range[]) => rs.map(([a, b]) => ({ from: round3(a / p.fps), to: round3(b / p.fps) }));
   const data = {
     out,
     excerpt,
     kind: full ? "full" : "partial",
-    asked: asked.map(([a, b]) => ({ from: round3(a / p.fps), to: round3(b / p.fps) })),
-    rendered: ranges.map(([a, b]) => ({ from: round3(a / p.fps), to: round3(b / p.fps) })),
+    asked: asSeconds(asked),
+    rendered: asSeconds(ranges),
     frames: { total, shot },
     restarts,
-    fullBecause: full ? fullBecause : null,
+    fullBecause: full ? done.fullBecause : null,
     check: { rounds: checks.length, samples: checks.map((c) => c.samples), differing, unstable },
-    seconds: { screenshots: secs(timings.screenshots), check: secs(timings.check), encode: secs(timings.encode), total: secs(Date.now() - t0) },
+    seconds,
   };
-  const s = data.seconds;
   const checkLine = !checks.length
     ? (full ? "not needed for a full render" : "skipped (--no-verify)")
     : differing.length
-      ? `${differing.length} frames outside the asked ranges differed from the cache; widened to ${full ? "the whole video" : spans(ranges)}`
+      ? `${differing.length} frames outside the asked ranges differed from the cache; widened to ${full ? "the whole video" : spans(p, ranges)}`
       : `${checks[0].samples} frames outside the range re-shot, all match the cache${unstable.length ? `; ${unstable.length} of them only after arriving another way` : ""}`;
   const text = [
     ...(out ? [out] : []),
-    full ? `full render: ${total} frames${asked.length && fullBecause ? ` (${fullBecause})` : ""}` : `partial render: ${spans(ranges)}, ${shot} of ${total} frames shot`,
-    `screenshots  ${s.screenshots.toFixed(1)} s  (${shot} frames, ${(shot / Math.max(s.screenshots, 0.001)).toFixed(1)} frames/s, ${cfg.render.workers} workers${restarts ? `, started over ${restarts}x after the page changed` : ""})`,
-    `check        ${s.check.toFixed(1)} s  (${checkLine})`,
-    out ? `encode       ${s.encode.toFixed(1)} s  (${excerpt ? `only the excerpt, ${sizeOf(ranges)}` : total} frames from the cache)` : "encode       skipped (--no-encode)",
-    `total        ${s.total.toFixed(1)} s`,
+    full ? `full render: ${total} frames${asked.length && done.fullBecause ? ` (${done.fullBecause})` : ""}` : `partial render: ${spans(p, ranges)}, ${shot} of ${total} frames shot`,
+    `screenshots  ${seconds.screenshots.toFixed(1)} s  (${shot} frames, ${(shot / Math.max(seconds.screenshots, 0.001)).toFixed(1)} frames/s, ${cfg.render.workers} workers${restarts ? `, started over ${restarts}x after the page changed` : ""})`,
+    `check        ${seconds.check.toFixed(1)} s  (${checkLine})`,
+    out ? `encode       ${seconds.encode.toFixed(1)} s  (${excerpt ? `only the excerpt, ${sizeOf(ranges)}` : total} frames from the cache)` : "encode       skipped (--no-encode)",
+    `total        ${seconds.total.toFixed(1)} s`,
   ].join("\n");
   return { data, text };
 }

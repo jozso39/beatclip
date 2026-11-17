@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import type { Args } from "../args";
 import { shootPicture, withSession } from "../browser";
@@ -6,7 +6,7 @@ import type { Config } from "../config";
 import { difference, grabFrame, probeVideo } from "../ffmpeg";
 import { describe, shotAt, type Project } from "../project";
 import { uniquePath } from "../sheet";
-import { CliError, fmtTime, parseTime, round3, stamp } from "../time";
+import { CliError, fmtSpan, fmtTime, parseTime, round3, stamp } from "../time";
 import type { Result } from "./lookup";
 
 export const STATUSES = ["open", "done", "verified", "rejected"] as const;
@@ -43,13 +43,26 @@ export function loadNotes(cfg: Config): Note[] {
   return JSON.parse(readFileSync(cfg.notes, "utf8")).notes;
 }
 
+/** Writes the ledger through a temporary file, so an interrupted write cannot leave half a ledger. */
 function saveNotes(cfg: Config, notes: Note[]) {
-  writeFileSync(cfg.notes, JSON.stringify({ notes }, null, 1) + "\n");
+  const tmp = `${cfg.notes}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ notes }, null, 1) + "\n");
+  renameSync(tmp, cfg.notes);
 }
 
-function noteById(notes: Note[], id: string): Note {
+export function noteById(notes: Note[], id: string): Note {
   const note = notes.find((n) => n.id === Number(id));
   if (!note) throw new CliError(`no note ${id} (notes: ${notes.map((n) => n.id).join(", ") || "none yet"})`);
+  return note;
+}
+
+/** Changes one note in the ledger as it is on disk right now (another command may have written it meanwhile) and saves it. */
+function updateNote(cfg: Config, id: string, change: (note: Note) => void): Note {
+  const all = loadNotes(cfg);
+  const note = noteById(all, id);
+  change(note);
+  note.updated = new Date().toISOString();
+  saveNotes(cfg, all);
   return note;
 }
 
@@ -68,7 +81,7 @@ export function noteRange(p: Project, note: Note): [number, number] {
 /** Notes still waiting to be seen in a render: everything not verified or rejected. */
 export const pendingNotes = (notes: Note[]) => notes.filter((n) => n.status === "open" || n.status === "done");
 
-const when = (n: Note) => (n.to !== undefined ? `${fmtTime(n.t)}–${fmtTime(n.to)}` : fmtTime(n.t));
+const when = (n: Note) => (n.to !== undefined ? fmtSpan(n.t, n.to) : fmtTime(n.t));
 const cell = (s: string) => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
 
 function listText(p: Project, notes: Note[]): string {
@@ -104,19 +117,29 @@ async function takeProof(p: Project, note: Note, side: "before" | "after", video
   return { file: relative(p.cfg.root, file), source: video ? relative(p.cfg.root, video) : "live page", t };
 }
 
+/** A note's end time from --to: after its start, inside the video; "none" removes it. */
+function endTime(p: Project, args: Args, start: number): number | undefined {
+  if (args.str("to") === "none") return undefined;
+  const to = args.time("to")!;
+  if (to <= start) throw new CliError("--to must be after the note's time");
+  if (to > p.duration) throw new CliError(`--to is past the end of the video (${fmtTime(p.duration)})`);
+  return to;
+}
+
 /** `notes add|list|set|proof|remove|report`: the ledger tying each note to its time, status and proof frames. */
 export async function notes(p: Project, args: Args, cwd: string): Promise<Result> {
+  args.allow(["to", "status", "shows", "text", "video", "at", "out"]);
   const cfg = p.cfg;
-  const all = loadNotes(cfg);
   const action = args.rest.shift() ?? "list";
-  const now = new Date().toISOString();
 
   if (action === "add") {
     const t = parseTime(args.take("the note's time (beatclip notes add 1:07 \"the ball should land on the beat\")"));
+    if (t >= p.duration) throw new CliError(`${fmtTime(t)} is past the end of the video (${fmtTime(p.duration)})`);
     const text = args.rest.join(" ").trim();
     if (!text) throw new CliError("missing the note's text");
-    const to = args.time("to");
-    if (to !== undefined && to <= t) throw new CliError("--to must be after the note's time");
+    const to = args.has("to") ? endTime(p, args, t) : undefined;
+    const now = new Date().toISOString();
+    const all = loadNotes(cfg);
     const note: Note = { id: Math.max(0, ...all.map((n) => n.id)) + 1, t, ...(to === undefined ? {} : { to }), text, status: "open", created: now, updated: now };
     saveNotes(cfg, [...all, note]);
     const m = describe(p, t);
@@ -124,42 +147,60 @@ export async function notes(p: Project, args: Args, cwd: string): Promise<Result
   }
 
   if (action === "list") {
+    args.noMore();
     const status = args.str("status");
-    const shown = status ? all.filter((n) => n.status === asStatus(status)) : all;
+    const shown = loadNotes(cfg).filter((n) => !status || n.status === asStatus(status));
     return { data: shown, text: listText(p, shown) };
   }
 
   if (action === "set") {
-    const note = noteById(all, args.take("a note id"));
-    if (args.rest[0]) note.status = asStatus(args.rest[0]);
-    if (args.has("shows")) note.shows = args.str("shows");
-    if (args.has("text")) note.text = args.str("text")!;
-    if (args.has("to")) note.to = args.time("to");
-    note.updated = now;
-    saveNotes(cfg, all);
+    const id = args.take("a note id");
+    const status = args.rest.shift();
+    args.noMore();
+    const note = updateNote(cfg, id, (n) => {
+      if (status) n.status = asStatus(status);
+      if (args.has("shows")) n.shows = args.str("shows");
+      if (args.has("text")) n.text = args.str("text")!;
+      if (args.has("to")) {
+        const to = endTime(p, args, n.t);
+        if (to === undefined) delete n.to;
+        else n.to = to;
+      }
+    });
     return { data: note, text: listText(p, [note]) };
   }
 
   if (action === "proof") {
-    const note = noteById(all, args.take("a note id"));
+    const id = args.take("a note id");
     const side = args.take("before or after");
+    args.noMore();
     if (side !== "before" && side !== "after") throw new CliError(`proof is "before" or "after", not "${side}"`);
     const video = args.str("video") && resolve(cwd, args.str("video")!);
-    note[side] = await takeProof(p, note, side, video, args.time("at") ?? note.t);
-    if (note.before && note.after) note.diff = round3(await difference(resolve(cfg.root, note.before.file), resolve(cfg.root, note.after.file), cfg.page.width / cfg.page.height));
-    note.updated = now;
-    saveNotes(cfg, all);
+    const known = noteById(loadNotes(cfg), id);
+    const proof = await takeProof(p, known, side, video, args.time("at") ?? known.t);
+    const other = known[side === "before" ? "after" : "before"];
+    const diff = other && round3(await difference(resolve(cfg.root, proof.file), resolve(cfg.root, other.file), cfg.page.width / cfg.page.height));
+    // The capture took a while: apply the result to the ledger as it is now.
+    const note = updateNote(cfg, id, (n) => {
+      n[side] = proof;
+      if (diff !== undefined) n.diff = diff;
+    });
     const alike = note.diff === undefined ? "" : `\nbefore and after: diff ${note.diff.toFixed(1)}${note.diff < cfg.differs ? "  (they look unchanged: the change does not read in the frame)" : ""}`;
-    return { data: note, text: `${resolve(cfg.root, note[side]!.file)}\nnote #${note.id} ${side} proof at ${fmtTime(note[side]!.t)} from ${note[side]!.source}${alike}` };
+    return { data: note, text: `${resolve(cfg.root, proof.file)}\nnote #${note.id} ${side} proof at ${fmtTime(proof.t)} from ${proof.source}${alike}` };
   }
 
   if (action === "remove") {
-    const note = noteById(all, args.take("a note id"));
+    const id = args.take("a note id");
+    args.noMore();
+    const all = loadNotes(cfg);
+    const note = noteById(all, id);
     saveNotes(cfg, all.filter((n) => n !== note));
     return { data: note, text: `removed note #${note.id}` };
   }
 
   if (action === "report") {
+    args.noMore();
+    const all = loadNotes(cfg);
     const out = args.str("out") && resolve(cwd, args.str("out")!);
     const md = reportMarkdown(p, all, out ? dirname(out) : cfg.root);
     if (out) writeFileSync(out, md + "\n");

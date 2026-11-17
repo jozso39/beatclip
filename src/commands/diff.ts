@@ -2,7 +2,7 @@ import { basename, relative, resolve } from "node:path";
 import type { Args } from "../args";
 import { differences, probeVideo } from "../ffmpeg";
 import type { Project } from "../project";
-import { CliError, fmtTime, round3 } from "../time";
+import { CliError, fmtSpan, fmtTime, round3 } from "../time";
 import type { Result } from "./lookup";
 import { loadNotes, noteRange, type Note } from "./notes";
 
@@ -39,8 +39,10 @@ const overlaps = (a: [number, number], b: [number, number]) => a[0] < b[1] && b[
  * and which notes that should have changed something show no difference at all.
  */
 export async function diff(p: Project, args: Args, cwd: string): Promise<Result> {
+  args.allow(["threshold", "gap"]);
   const a = resolve(cwd, args.take("the first video (beatclip diff <a.mp4> <b.mp4>)"));
   const b = resolve(cwd, args.take("the second video"));
+  args.noMore();
   const [ia, ib] = [await probeVideo(a), await probeVideo(b)];
   if (Math.abs(ia.fps - ib.fps) > 0.01) throw new CliError(`the two videos have different frame rates (${ia.fps} and ${ib.fps})`);
   const threshold = args.num("threshold") ?? p.cfg.differs;
@@ -57,11 +59,11 @@ export async function diff(p: Project, args: Args, cwd: string): Promise<Result>
   // A note accounts for a range anywhere in its shot, but it only "shows" when something differs right where it points.
   const near = (n: Note): [number, number] => (n.to !== undefined ? [n.t, n.to] : [n.t - NEAR, n.t + NEAR]);
   const silent = notes.filter((n) => n.status !== "open" && !ranges.some((range) => overlaps(near(n), [range.from, range.to])));
-  const lengthNote = ia.frames === ib.frames ? null : `${basename(a)} has ${ia.frames} frames, ${basename(b)} has ${ib.frames}; the first ${diffs.length} were compared`;
+  const lengthNote = ia.frames === ib.frames ? null : `${basename(a)} has ${ia.frames} frames, ${basename(b)} has ${ib.frames}; only the first ${diffs.length} could be compared`;
 
   const rows = explained.map((x) => {
     const who = notes.length ? (x.notes.length ? `notes ${x.notes.map((id) => `#${id}`).join(" ")}` : "NO NOTE") : "";
-    return `  ${`${fmtTime(x.from)}–${fmtTime(x.to)}`.padEnd(19)} ${(x.to - x.from).toFixed(2).padStart(6)} s   peak diff ${x.peak.toFixed(1).padStart(5)} at ${fmtTime(x.peakAt)}   ${x.shots.join(",").padEnd(12)} ${who}`;
+    return `  ${fmtSpan(x.from, x.to).padEnd(19)} ${(x.to - x.from).toFixed(2).padStart(6)} s   peak diff ${x.peak.toFixed(1).padStart(5)} at ${fmtTime(x.peakAt)}   ${x.shots.join(",").padEnd(12)} ${who}`;
   });
   const unexplained = explained.filter((x) => !x.notes.length).length;
   const longest = ranges.reduce<DiffRange | null>((top, r) => (!top || r.to - r.from > top.to - top.from ? r : top), null);

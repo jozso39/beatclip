@@ -49,4 +49,20 @@ export class Args {
     if (v === undefined) throw new CliError(`missing ${what}`);
     return v;
   }
+
+  /**
+   * Fails on an option the command does not have (a typo would otherwise silently change what runs)
+   * and on a single-valued option given twice. --json, --project and --help belong to every command.
+   */
+  allow(options: string[], repeatable: string[] = []) {
+    for (const [name, values] of this.flags) {
+      if (!["json", "project", "help", ...options, ...repeatable].includes(name)) throw new CliError(`unknown option --${name} (this command takes: ${[...options, ...repeatable].map((o) => `--${o}`).join(" ") || "no options"})`);
+      if (values.length > 1 && !repeatable.includes(name)) throw new CliError(`--${name} was given ${values.length} times; it takes one value`);
+    }
+  }
+
+  /** Fails when positional arguments are left that the command would ignore. */
+  noMore() {
+    if (this.rest.length) throw new CliError(`unexpected argument "${this.rest[0]}"`);
+  }
 }

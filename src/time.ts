@@ -23,6 +23,9 @@ export function fmtTime(t: number, digits = 2): string {
 /** "1:07.50 (67.50 s)": both spellings, so nobody converts by hand. */
 export const fmtBoth = (t: number) => `${fmtTime(t)} (${t.toFixed(2)} s)`;
 
+/** A stretch of time: "1:05.30–1:09.30". */
+export const fmtSpan = (from: number, to: number) => `${fmtTime(from)}–${fmtTime(to)}`;
+
 /** A signed distance in seconds: "+0.12 s", "-1.50 s". */
 export const fmtDelta = (d: number) => `${d >= 0 ? "+" : "-"}${Math.abs(d).toFixed(2)} s`;
 

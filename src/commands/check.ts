@@ -3,7 +3,7 @@ import type { Page } from "playwright-core";
 import type { Args } from "../args";
 import { withSession } from "../browser";
 import type { Config, ProbeRule } from "../config";
-import { nearestBeat, type Project } from "../project";
+import { frameCount, nearestBeat, type Project, type Word } from "../project";
 import { CliError, fmtDelta, fmtTime, parseTime, round3 } from "../time";
 import type { Result } from "./lookup";
 
@@ -65,7 +65,7 @@ function union(boxes: Box[]): Box | null {
 const probeSelector = (name: string) => `[data-probe="${name}"]`;
 const frameTimes = (p: Project, from: number, to: number) => {
   const out: number[] = [];
-  for (let f = Math.ceil(from * p.fps - 1e-6); f / p.fps <= to + 1e-6 && f < Math.floor(p.duration * p.fps); f++) out.push(round3(f / p.fps));
+  for (let f = Math.max(0, Math.ceil(from * p.fps - 1e-6)); f / p.fps <= to + 1e-6 && f < frameCount(p); f++) out.push(round3(f / p.fps));
   return out;
 };
 
@@ -94,8 +94,14 @@ export function extremes(series: { t: number; box: Box | null }[], which: "lowes
 
 const intersects = (a: Box, b: Box) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
 
+/** The CSS selector of a lyric word's element, from the config's template. */
+const wordSelector = (cfg: Config, w: Word) => cfg.check.selector.replaceAll("{line}", w.line).replaceAll("{word}", String(w.index));
+
 export interface Problem {
-  /** What it is about: a lyric word "<line>.<n>", or "probe:<name>". */
+  /**
+   * What exactly is wrong, precise enough that a different failure gets a different key: a lyric word "<line>.<n>",
+   * or for a probe rule the probe, the rule, and the time or the other element ("probe:ball lowest-on-beat 3.70").
+   */
   key: string;
   /** missing | late | outside | early | off-beat | overlap | no-extreme */
   kind: string;
@@ -107,14 +113,15 @@ export interface Problem {
 async function checkWords(page: Page, p: Project): Promise<{ words: number; problems: Problem[] }> {
   const c = p.cfg.check;
   const words = p.lines.filter((l) => l.kind === "line" || c.shouts).flatMap((l) => l.words);
-  const selector = (w: (typeof words)[number]) => c.selector.replaceAll("{line}", w.line).replaceAll("{word}", String(w.index));
-  const boxes = await measure(page, p.cfg, words.flatMap((w) => [{ selector: selector(w), t: w.s + c.after }, { selector: selector(w), t: w.s - c.before }]));
+  // A word that starts within `before` seconds of time 0 has no "shortly before" to look at.
+  const early = (w: Word) => (w.s - c.before >= 0 ? w.s - c.before : null);
+  const boxes = await measure(page, p.cfg, words.flatMap((w) => [{ selector: wordSelector(p.cfg, w), t: w.s + c.after }, { selector: wordSelector(p.cfg, w), t: early(w) ?? w.s + c.after }]));
   const best = (list: Box[]) => list.reduce<Box | null>((top, b) => (!top || b.shown > top.shown ? b : top), null);
   const problems: Problem[] = [];
   words.forEach((w, i) => {
     const say = (kind: string, message: string) => problems.push({ key: w.key, kind, t: w.s, message: `${fmtTime(w.s)}  ${w.key.padEnd(8)} ${`"${w.w}"`.padEnd(16)} ${message}` });
     const at = best(boxes[2 * i]);
-    const before = best(boxes[2 * i + 1]);
+    const before = early(w) === null ? null : best(boxes[2 * i + 1]);
     if (!at) return say("missing", "never drawn (no element for this word)");
     if (at.shown < c.visible) say("late", `not visible at its first sound (shown ${at.shown.toFixed(2)})`);
     else if (at.left < c.frame.left || at.right > c.frame.right || at.top < c.frame.top || at.bottom > c.frame.bottom)
@@ -125,31 +132,32 @@ async function checkWords(page: Page, p: Project): Promise<{ words: number; prob
 }
 
 async function checkRule(page: Page, p: Project, rule: ProbeRule): Promise<Problem[]> {
-  const key = `probe:${rule.probe}`;
+  const rule_ = `probe:${rule.probe} ${rule.assert}`;
+  const say = (kind: string, t: number, detail: string, what: string): Problem => ({ key: detail ? `${rule_} ${detail}` : rule_, kind, t, message: `${fmtTime(t)}  probe:${rule.probe}  ${what}` });
   const times = frameTimes(p, rule.from, rule.to);
   const own = (await measure(page, p.cfg, times.map((t) => ({ selector: probeSelector(rule.probe), t })))).map(union);
-  if (own.every((b) => !b)) return [{ key, kind: "missing", t: rule.from, message: `${fmtTime(rule.from)}  ${key}  never visible between ${fmtTime(rule.from)} and ${fmtTime(rule.to)}` }];
+  if (own.every((b) => !b)) return [say("missing", rule.from, "", `never visible between ${fmtTime(rule.from)} and ${fmtTime(rule.to)}`)];
 
   if (rule.assert === "lowest-on-beat" || rule.assert === "highest-on-beat") {
     const which = rule.assert === "lowest-on-beat" ? "lowest" : "highest";
     const tolerance = rule.tolerance ?? 0.05;
     const found = extremes(times.map((t, i) => ({ t, box: own[i] })), which);
-    if (!found.length) return [{ key, kind: "no-extreme", t: rule.from, message: `${fmtTime(rule.from)}  ${key}  has no ${which} point between ${fmtTime(rule.from)} and ${fmtTime(rule.to)}` }];
+    if (!found.length) return [say("no-extreme", rule.from, "", `has no ${which} point between ${fmtTime(rule.from)} and ${fmtTime(rule.to)}`)];
     return found
       .map((x) => ({ x, beat: nearestBeat(p.grid, x.t, rule.half) }))
       .filter(({ beat }) => Math.abs(beat.delta) > tolerance)
-      .map(({ x, beat }) => ({ key, kind: "off-beat", t: x.t, message: `${fmtTime(x.t)}  ${key}  ${which} point is ${fmtDelta(beat.delta)} from beat ${beat.n} (${fmtTime(beat.t)})` }));
+      .map(({ x, beat }) => say("off-beat", x.t, x.t.toFixed(2), `${which} point is ${fmtDelta(beat.delta)} from beat ${beat.n} (${fmtTime(beat.t)})`));
   }
 
   if (rule.assert === "no-overlap") {
     const others = rule.with === "words" || !rule.with
-      ? p.words.filter((w) => w.e > rule.from && w.s < rule.to).map((w) => ({ name: `word ${w.key} "${w.w}"`, selector: p.cfg.check.selector.replaceAll("{line}", w.line).replaceAll("{word}", String(w.index)) }))
-      : [{ name: `probe ${rule.with}`, selector: probeSelector(rule.with) }];
+      ? p.words.filter((w) => w.e > rule.from && w.s < rule.to).map((w) => ({ id: `word ${w.key}`, name: `word ${w.key} "${w.w}"`, selector: wordSelector(p.cfg, w) }))
+      : [{ id: `probe ${rule.with}`, name: `probe ${rule.with}`, selector: probeSelector(rule.with) }];
     const problems: Problem[] = [];
     for (const other of others) {
       const theirs = (await measure(page, p.cfg, times.map((t) => ({ selector: other.selector, t })))).map(union);
       const hit = times.filter((_, i) => own[i] && theirs[i] && intersects(own[i]!, theirs[i]!));
-      if (hit.length) problems.push({ key, kind: "overlap", t: hit[0], message: `${fmtTime(hit[0])}  ${key}  overlaps ${other.name} from ${fmtTime(hit[0])} to ${fmtTime(hit.at(-1)!)} (${hit.length} frames)` });
+      if (hit.length) problems.push(say("overlap", hit[0], other.id, `overlaps ${other.name} from ${fmtTime(hit[0])} to ${fmtTime(hit.at(-1)!)} (${hit.length} frames)`));
     }
     return problems;
   }
@@ -167,6 +175,8 @@ interface Allowed {
  * exceptions; the exit code is 1 only when there are new ones. --update-allow accepts the current problems.
  */
 export async function check(p: Project, args: Args): Promise<Result> {
+  args.allow(["update-allow", "all"]);
+  args.noMore();
   const cfg = p.cfg;
   const allowed: Allowed[] = existsSync(cfg.check.allow) ? JSON.parse(readFileSync(cfg.check.allow, "utf8")).allow : [];
   const { words, problems } = await withSession(cfg, async (s) => {
@@ -201,6 +211,7 @@ export async function check(p: Project, args: Args): Promise<Result> {
  * at the given times; with --lowest / --highest, its turning points in a range and how far each is from a beat.
  */
 export async function probe(p: Project, args: Args): Promise<Result> {
+  args.allow(["selector", "from", "to", "lowest", "highest", "half"]);
   const selector = args.str("selector") ?? probeSelector(args.take("a probe name (or --selector <css>)"));
   const range = args.has("from") || args.has("to");
   const times = range ? frameTimes(p, args.time("from") ?? 0, args.time("to") ?? p.duration) : args.rest.map(parseTime);

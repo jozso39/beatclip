@@ -2,7 +2,6 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { relative, resolve } from "node:path";
 import { readHook, withSession } from "./browser";
 import type { Config, Cue, ShotDef } from "./config";
-import { probeDuration } from "./ffmpeg";
 import { CliError, round3 } from "./time";
 
 export interface Word {
@@ -72,7 +71,9 @@ export function loadGrid(cfg: Config): Grid {
   if (!("file" in b)) return { ...constantGrid(b.first, b.interval), perBar: b.perBar };
   if (!existsSync(b.file)) throw new CliError(`no beats file at ${b.file} (write one with: beatclip analyze beats <audio>)`);
   const raw = JSON.parse(readFileSync(b.file, "utf8"));
-  return { ...listGrid(Array.isArray(raw) ? raw : raw.beats), perBar: b.perBar };
+  const times = Array.isArray(raw) ? raw : raw.beats;
+  if (!Array.isArray(times) || times.some((t) => typeof t !== "number")) throw new CliError(`${b.file} must be a list of beat times in seconds, or { "beats": [...] }`);
+  return { ...listGrid(times), perBar: b.perBar };
 }
 
 /** Lyrics file: `lines` of words {w,s,e}; optional `shouts` of letters {c,s,e} are read as lines of one-letter words. */
@@ -117,10 +118,9 @@ interface Facts {
   shots: ShotDef[];
 }
 
-/** Duration and shot list. Read from the page hooks when the config does not state them; cached until a source changes. */
+/** Duration and shot list: from the config when it states them, otherwise from the page hooks (cached until a source changes). */
 async function loadFacts(cfg: Config): Promise<Facts> {
-  const needPage = !cfg.shots || (cfg.duration === undefined && !cfg.audio);
-  if (!needPage) return { shots: cfg.shots!, duration: cfg.duration ?? (await probeDuration(cfg.audio!)) };
+  if (cfg.shots && cfg.duration !== undefined) return { shots: cfg.shots, duration: cfg.duration };
   if (!cfg.shots && !cfg.page.shots) throw new CliError(`the config needs "shots" (a list) or "page.shots" (the name of a window hook)`);
   const cacheFile = resolve(cfg.root, ".beatclip", "page.json");
   const newest = newestSource(cfg).mtime;
@@ -183,6 +183,11 @@ export async function loadProject(cfg: Config): Promise<Project> {
   };
 }
 
+/** Number of frames in the video; frames are numbered 0 .. frameCount - 1. */
+export const frameCount = (p: Project) => Math.floor(p.duration * p.fps);
+/** The video frame showing time t (times outside the video give its first or last frame). */
+export const frameAt = (p: Project, t: number) => Math.min(Math.max(Math.round(t * p.fps), 0), frameCount(p) - 1);
+
 export const shotAt = (p: Project, t: number) => p.shots.findLast((s) => s.s <= t) ?? null;
 export const wordAt = (p: Project, t: number) => p.words.findLast((w) => w.s <= t && t < w.e) ?? null;
 
@@ -233,7 +238,7 @@ export function describe(p: Project, t: number): Moment {
   const bars = p.grid.perBar ? { bar: Math.floor(index / p.grid.perBar) + 1, inBar: (((index % p.grid.perBar) + p.grid.perBar) % p.grid.perBar) + 1 } : {};
   return {
     t: round3(t),
-    frame: Math.round(t * p.fps),
+    frame: frameAt(p, t),
     shot: shot && { ...shot, into: round3(t - shot.s) },
     line: line && { id: line.id, text: line.text, s: line.s, e: line.e },
     word,

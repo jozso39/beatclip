@@ -41,7 +41,7 @@ export interface Config {
   audio?: string;
   lyrics?: string;
   shots?: ShotDef[];
-  /** Globs of files whose change makes cached shots and shot frames stale. */
+  /** Globs of the files the picture depends on: a change refreshes the cached shot list and makes a running render shoot again. */
   sources: string[];
   cues: Cue[];
   beats: BeatsConfig;

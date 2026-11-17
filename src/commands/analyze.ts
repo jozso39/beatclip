@@ -30,13 +30,17 @@ export function fitGrid(beats: number[]): { first: number; interval: number; wor
  * Needs a Python with librosa (--python, or "python" in the config); nothing else in beatclip needs Python.
  */
 export async function analyze(cfg: Config | null, args: Args, cwd: string): Promise<Result> {
+  args.allow(["python", "out"]);
   const what = args.take("what to analyze (beatclip analyze beats <audio>)");
   if (what !== "beats") throw new CliError(`cannot analyze "${what}" (only: beats)`);
-  const audio = args.rest[0] ? resolve(cwd, args.rest[0]) : cfg?.audio;
+  const given = args.rest.shift();
+  args.noMore();
+  const audio = given ? resolve(cwd, given) : cfg?.audio;
   if (!audio) throw new CliError("missing the audio file (beatclip analyze beats <audio>)");
   if (!existsSync(audio)) throw new CliError(`no such audio file: ${audio}`);
   const python = args.str("python") ?? cfg?.python ?? "python3";
-  const configured = cfg && "file" in cfg.beats ? cfg.beats.file : undefined;
+  // The config's beats file is the default only for the config's own song; another audio file gets its own file.
+  const configured = !given && cfg && "file" in cfg.beats ? cfg.beats.file : undefined;
   const out = args.str("out") ? resolve(cwd, args.str("out")!) : (configured ?? resolve(cfg?.root ?? cwd, `${basename(audio, extname(audio))}.beats.json`));
 
   const r = await run([python, "-c", BEATS_PY, audio]);

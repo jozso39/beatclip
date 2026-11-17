@@ -74,11 +74,12 @@ export async function composeSheets(browser: Browser, spec: SheetSpec, work: str
   } finally {
     await ctx.close();
   }
-  return drawn.map((png, n) => {
-    const out = dest(n, pages);
-    if (existsSync(out)) throw new CliError(`refusing to overwrite ${out}`);
+  const outs = drawn.map((_, n) => dest(n, pages));
+  const taken = outs.find((out) => existsSync(out));
+  if (taken) throw new CliError(`refusing to overwrite ${taken}`);
+  outs.forEach((out, n) => {
     mkdirSync(dirname(out), { recursive: true });
-    copyFileSync(png, out);
-    return out;
+    copyFileSync(drawn[n], out);
   });
+  return outs;
 }

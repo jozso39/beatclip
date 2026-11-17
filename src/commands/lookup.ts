@@ -1,6 +1,6 @@
 import type { Args } from "../args";
 import { describe, nearestBeat, type Moment, type Project } from "../project";
-import { CliError, fmtBoth, fmtDelta, fmtTime, parseTime, round3 } from "../time";
+import { CliError, fmtBoth, fmtDelta, fmtSpan, fmtTime, parseTime, round3 } from "../time";
 
 export interface Result {
   data: unknown;
@@ -9,15 +9,13 @@ export interface Result {
   exit?: number;
 }
 
-const span = (s: number, e: number) => `${fmtTime(s)}–${fmtTime(e)}`;
-
 /** The readable lines for a moment (shared by `at` and `beat`). */
 export function momentLines(m: Moment): string[] {
   const out: string[] = [];
-  if (m.shot) out.push(`shot   ${m.shot.id}  ${span(m.shot.s, m.shot.e)}  (${m.shot.into.toFixed(2)} s in)${m.shot.file ? `  ${m.shot.file}` : ""}`);
+  if (m.shot) out.push(`shot   ${m.shot.id}  ${fmtSpan(m.shot.s, m.shot.e)}  (${m.shot.into.toFixed(2)} s in)${m.shot.file ? `  ${m.shot.file}` : ""}`);
   else out.push("shot   none");
-  if (m.line) out.push(`line   ${m.line.id}  "${m.line.text}"  ${span(m.line.s, m.line.e)}`);
-  if (m.word) out.push(`word   ${m.word.key}  "${m.word.w}"  ${span(m.word.s, m.word.e)}  (being sung)`);
+  if (m.line) out.push(`line   ${m.line.id}  "${m.line.text}"  ${fmtSpan(m.line.s, m.line.e)}`);
+  if (m.word) out.push(`word   ${m.word.key}  "${m.word.w}"  ${fmtSpan(m.word.s, m.word.e)}  (being sung)`);
   else {
     const prev = m.prevWord ? `last ${m.prevWord.key} "${m.prevWord.w}" ended ${m.prevWord.ago.toFixed(2)} s ago` : "no word before";
     const next = m.nextWord ? `next ${m.nextWord.key} "${m.nextWord.w}" at ${fmtTime(m.nextWord.s)} (in ${m.nextWord.in.toFixed(2)} s)` : "no word after";
@@ -29,10 +27,15 @@ export function momentLines(m: Moment): string[] {
   return out;
 }
 
+/** A line saying that a time is not inside the video, or nothing. */
+const outside = (p: Project, t: number) => (t < 0 || t >= p.duration ? [`note   ${fmtTime(t)} is outside the video (0:00.00 to ${fmtTime(p.duration)})`] : []);
+
 export function at(p: Project, args: Args): Result {
+  args.allow([]);
   const t = parseTime(args.take("a time (beatclip at 1:07)"));
+  args.noMore();
   const m = describe(p, t);
-  const warn = t > p.duration ? [`note   ${fmtTime(t)} is past the end of the video (${fmtTime(p.duration)})`] : [];
+  const warn = outside(p, t);
   return { data: m, text: [`${fmtBoth(t)}  frame ${m.frame}`, ...momentLines(m), ...warn].join("\n") };
 }
 
@@ -48,14 +51,15 @@ interface Hit {
 
 /** Times of the shots, cues, lyric lines and lyric words (or runs of words) matching a text. */
 export function find(p: Project, args: Args): Result {
+  args.allow([]);
   const query = norm(args.rest.join(" "));
   if (!query) throw new CliError("missing the text to look for (beatclip find <text>)");
   const tokens = query.split(/\s+/);
   const hits: Hit[] = [];
-  for (const s of p.shots) if (s.id.toLowerCase().includes(query)) hits.push({ kind: "shot", id: s.id, t: s.s, e: s.e, text: s.file ?? "" });
+  for (const s of p.shots) if (norm(s.id).includes(query)) hits.push({ kind: "shot", id: s.id, t: s.s, e: s.e, text: s.file ?? "" });
   for (const c of p.cues) if (norm(c.name).includes(query)) hits.push({ kind: "cue", id: c.name, t: c.t, text: "" });
   for (const l of p.lines) {
-    if (l.id.toLowerCase() === query || (tokens.length > 1 && norm(l.text).includes(query))) hits.push({ kind: "line", id: l.id, t: l.s, e: l.e, text: l.text });
+    if (norm(l.id) === query || (tokens.length > 1 && norm(l.text).includes(query))) hits.push({ kind: "line", id: l.id, t: l.s, e: l.e, text: l.text });
     const words = l.words.map((w) => norm(w.w));
     for (let i = 0; i + tokens.length <= words.length; i++) {
       const run = tokens.every((tok, k) => (k === tokens.length - 1 ? words[i + k].startsWith(tok) : words[i + k] === tok));
@@ -72,13 +76,18 @@ export function find(p: Project, args: Args): Result {
  * on the half-beat grid with --half, moved by +N / -N beats, or beat number --n.
  */
 export function beat(p: Project, args: Args): Result {
+  args.allow(["next", "prev", "half", "n"]);
+  if (args.has("next") && args.has("prev")) throw new CliError("--next and --prev cannot be used together");
   const step = args.has("half") ? 0.5 : 1;
   const offsets = args.rest.filter((a) => /^[+-]\d+(\.\d+)?$/.test(a));
   const rest = args.rest.filter((a) => !offsets.includes(a));
   let n: number;
   let from: number | undefined;
-  if (args.has("n")) n = args.num("n")!;
-  else {
+  if (args.has("n")) {
+    if (rest.length) throw new CliError(`unexpected argument "${rest[0]}" with --n`);
+    n = args.num("n")!;
+  } else {
+    if (rest.length > 1) throw new CliError(`unexpected argument "${rest[1]}" (beat takes one time)`);
     if (!rest.length) throw new CliError("missing a time (beatclip beat 1:07 [--next|--prev] [--half] [+N|-N]) or --n <beat number>");
     from = parseTime(rest[0]);
     const pos = p.grid.pos(from) / step;
@@ -90,5 +99,5 @@ export function beat(p: Project, args: Args): Result {
   const t = round3(p.grid.time(n));
   const m = describe(p, t);
   const head = `beat ${n} at ${fmtBoth(t)}  frame ${m.frame}${from === undefined ? "" : `  (${fmtDelta(t - from)} from ${fmtTime(from)})`}`;
-  return { data: { n, t, time: fmtTime(t), from, moment: m }, text: [head, ...momentLines(m).slice(0, -1)].join("\n") };
+  return { data: { n, t, time: fmtTime(t), from, moment: m }, text: [head, ...momentLines(m).slice(0, -1), ...outside(p, t)].join("\n") };
 }

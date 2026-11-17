@@ -97,7 +97,7 @@ For `check`, each lyric word needs an element that a CSS selector can find from 
 | `page.start` | Command that starts the page's server when the URL does not answer (optional). It is stopped again when the command ends. |
 | `page.channel` | Browser channel for playwright-core, default `chrome`. |
 | `fps` | Frames per second of the video, default 60. |
-| `duration` | Length in seconds. Optional: otherwise read from the page hook. |
+| `duration` | Length in seconds. Optional: otherwise read from the page hook (and cached with the shot list). |
 | `audio` | The song: muxed into renders, and the default input of `analyze beats`. |
 | `lyrics` | JSON with `lines: [{ id, text, s, e, words: [{ w, s, e }] }]`. Optional `shouts: [{ id, s, e, letters: [{ c, s, e }] }]` (chanted letters) are read as lines of one-letter words. |
 | `sources` | Globs of the files the picture depends on. Used three ways: the shot list read from the page is cached until one of them changes, a render waits until they have been quiet for `render.settleMs`, and a render starts over when one changes while it is shooting. Shot ids are also searched in these files to report where a shot is defined. |
@@ -114,7 +114,7 @@ For `check`, each lyric word needs an element that a CSS selector can find from 
 
 Everywhere a time is expected you can write `1:07`, `1:07.5` or `67.5`. A lyric word is named `<line id>.<index from 0>`, for example `a2.1`. Beats are numbered from 0; `7.5` is the half beat after beat 7.
 
-Every command prints a readable answer by default and JSON with `--json`. Errors go to stderr with exit code 1 (and `{"error": ...}` on stdout with `--json`). Progress of long commands goes to stderr.
+Every command prints a readable answer by default and JSON with `--json`. Errors go to stderr with exit code 1 (and `{"error": ...}` on stdout with `--json`); an unexpected crash exits with 2. An option a command does not have, a leftover argument, or a one-value option given twice is an error, so a typo cannot silently turn into a different run. Progress of long commands goes to stderr.
 
 ## Commands
 
@@ -157,7 +157,7 @@ cue    "ball first lands" at 0:03.50 (+0.75 s from it)
 
 ### `beatclip analyze beats [audio]`
 
-For songs without a constant tempo: tracks the beats with librosa and writes a beat-times file to use as `"beats": { "file": ... }`. It also prints the constant grid that fits best and how far the worst beat is from it, so you can tell whether a constant grid is good enough. This is the only command that needs Python: `--python <path>` or `"python"` in the config, with librosa installed. `--out <file>` chooses the file.
+For songs without a constant tempo: tracks the beats with librosa and writes a beat-times file to use as `"beats": { "file": ... }`. It also prints the constant grid that fits best and how far the worst beat is from it, so you can tell whether a constant grid is good enough. This is the only command that needs Python: `--python <path>` or `"python"` in the config, with librosa installed. Without an audio argument it analyses the config's `audio` and writes the config's beats file if one is set; for any other audio it writes `<name>.beats.json` in the project root. `--out <file>` chooses the file.
 
 ```
 $ beatclip analyze beats --python ~/venv/bin/python --out out/click.beats.json
@@ -246,11 +246,13 @@ total        2.2 s
 
 Things it takes care of:
 
-- **A dev server that is reloading.** Before shooting it waits until no file in `sources` has changed for `render.settleMs`. If the page reloads or a source changes while it is shooting, it waits again and re-shoots those frames, instead of dying or mixing frames of two versions of the code.
+- **A dev server that is reloading.** Before shooting it waits until no file in `sources` has changed for `render.settleMs`. If the page reloads while it is shooting, it waits and shoots those frames again instead of dying. If a source file changes at any point of the render (while shooting, checking or widening), every range shot so far is shot again, so the cache never keeps frames of two versions of the code. This guard works from the files listed in `sources`: list everything the picture depends on.
+- **Two renders at once.** A lock in the cache folder lets only one render write a project's cache; the second one stops with an error. Other commands (`frames`, `check`, `notes`) can run alongside a render and share a page server started through `page.start`; it is stopped by whichever command finishes last.
 - **A cache that cannot be used.** With no cache yet, an incomplete one, or one shot with another size, frame rate, quality or URL, a partial render becomes a full one and says why.
 - **An interrupted partial render.** The ranges being re-shot are recorded and shot again with the next render.
 - **A page that is not quite a pure function of time.** A browser may paint the same time slightly differently after different earlier frames. A sampled frame that mismatches the cache is therefore re-shot arriving from other frames; if one of those reproduces the cached picture it is reported as unstable and nothing is widened.
-- **Output.** `{n}` in the video name is the first free number, so drafts are never overwritten. The file appears only when ffmpeg succeeded.
+- **Output.** `{n}` in the video name is the first free number. A name without `{n}` that already exists is refused before anything is shot, so a draft is never overwritten. The file appears only when ffmpeg succeeded.
+- **A video that got shorter.** A full render removes cached frames past the new end.
 
 Other options: `--full`, `--out <file>`, `--no-encode` (update the cache only), `--no-verify` (skip the check), `--no-widen` (fail instead of widening). The time each part took is always printed.
 
@@ -263,7 +265,7 @@ beatclip notes add 0:04 "the ball should be orange"         # --to <time> makes 
 beatclip notes list                                         # --status open|done|verified|rejected
 beatclip notes proof 1 before --video out/demo-1.mp4        # a frame at the note's time; without --video from the live page; --at <time>
 beatclip notes proof 1 after --video out/demo-2.mp4
-beatclip notes set 1 done --shows "an orange ball on the floor line under the word ball"
+beatclip notes set 1 done --shows "an orange ball on the floor line under the word ball"   # also --text, --to <time>, --to none
 beatclip notes remove 2
 beatclip notes report                                       # --out report.md
 ```
@@ -316,7 +318,7 @@ known  0:08.00  a3.3     "wide"           already visible 0.15 s before its firs
 16 words and 2 probe rules checked: 0 new problems, 1 known exceptions
 ```
 
-The allowlist is a file of `{ "allow": [{ "key": "a3.3", "kind": "early", "why": "..." }] }`. Kinds: `missing` (no element), `late` (not visible at its first sound), `outside` (outside the frame), `early`. An entry that is no longer a problem is reported as fixed.
+The allowlist is a file of `{ "allow": [{ "key": "a3.3", "kind": "early", "why": "..." }] }`. For a word the key is its name and the kinds are `missing` (no element), `late` (not visible at its first sound), `outside` (outside the frame) and `early`. For a probe rule the key names the probe, the rule and the exact failure, for example `probe:ball lowest-on-beat 3.70` (kind `off-beat`) or `probe:ball no-overlap word a2.1` (kind `overlap`), so a failure that moves counts as new. An entry that is no longer a problem is reported as fixed.
 
 Probe rules in `check.probes` assert things about elements marked `data-probe`, between `from` and `to`:
 
@@ -369,7 +371,7 @@ beatclip notes report                                        # the table to hand
 bun test
 ```
 
-`test/core.test.ts` covers the time, beat and range logic. `test/cli.test.ts` runs the real command line against a copy of the demo project (real Chrome, real ffmpeg): sheets, full and partial renders, a stale cache being caught, a source edited during a shoot, the ledger, `diff` and `check`.
+`test/core.test.ts` covers the time, beat and range logic. `test/cli.test.ts` runs the real command line against a copy of the demo project (real Chrome, real ffmpeg): sheets, full and partial renders, a stale cache being caught, a source edited during and after a shoot, two commands at once, the ledger, `diff` and `check`.
 
 ## License
 

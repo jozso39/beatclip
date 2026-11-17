@@ -5,16 +5,16 @@ import type { Browser } from "playwright-core";
 import type { Args } from "../args";
 import { launchBrowser, openSession, shootPicture, type Session } from "../browser";
 import { difference, grabFrame, pool, probeVideo } from "../ffmpeg";
-import { describe, nearestBeat, shotById, wordByKey, type Project } from "../project";
+import { describe, frameAt, nearestBeat, shotById, wordByKey, type Project } from "../project";
 import { composeSheets, uniquePath, type Tile } from "../sheet";
-import { CliError, fmtTime, parseTime, round3, stamp } from "../time";
+import { CliError, fmtSpan, fmtTime, parseTime, round3, stamp } from "../time";
 import type { Result } from "./lookup";
 
 const MAX_TILES = 96;
 
 /** Times from a to b: every `every` seconds, or `count` evenly spread. */
 function spread(a: number, b: number, every: number | undefined, count: number): number[] {
-  if (b <= a) throw new CliError(`the range ${fmtTime(a)}–${fmtTime(b)} is empty`);
+  if (b <= a) throw new CliError(`the range ${fmtSpan(a, b)} is empty`);
   const step = every ?? (b - a) / count;
   if (step <= 0) throw new CliError("--every must be above 0");
   const out: number[] = [];
@@ -44,6 +44,7 @@ export function pickTimes(p: Project, args: Args): { times: number[]; slug: stri
     const word = wordByKey(p, args.str("word")!);
     const window = args.num("window") ?? 0.3;
     const step = every ?? window / 2;
+    if (!(window > 0) || !(step > 0)) throw new CliError("--window and --every must be above 0");
     for (let i = -Math.round(window / step); i <= Math.round(window / step); i++) times.push(word.s + i * step);
     slug = `word-${word.key}`;
   } else if (args.has("beats")) {
@@ -54,10 +55,10 @@ export function pickTimes(p: Project, args: Args): { times: number[]; slug: stri
   } else if (range) times.push(...spread(range[0], range[1], every, count));
   if (!times.length) throw new CliError("which frames? give times, --from/--to, --shot <id>, --word <line>.<n> or --beats");
 
-  // Times made from a window or a range may reach past either end; those are pulled back onto the video.
-  const last = Math.floor(p.duration * p.fps) - 1;
-  const frames = new Set(times.map((t) => Math.min(Math.max(Math.round(t * p.fps), 0), last)));
-  const snapped = [...frames].sort((a, b) => a - b).map((f) => round3(f / p.fps));
+  // A window or a range may reach past either end of the video; only the part inside it is shown.
+  const inside = times.filter((t) => t >= 0 && t < p.duration);
+  if (!inside.length) throw new CliError(`none of the asked times lie inside the video (0:00.00 to ${fmtTime(p.duration)})`);
+  const snapped = [...new Set(inside.map((t) => frameAt(p, t)))].sort((a, b) => a - b).map((f) => round3(f / p.fps));
   if (snapped.length > MAX_TILES && !args.has("all")) throw new CliError(`${snapped.length} frames is a lot for contact sheets; narrow the range, raise --every, or pass --all`);
   return { times: snapped, slug };
 }
@@ -96,11 +97,14 @@ function tileLabel(p: Project, t: number, beatStep: number | null): string {
  * Any failed capture ends the command with an error and writes no sheet.
  */
 export async function frames(p: Project, args: Args, cwd: string): Promise<Result> {
+  args.allow(["every", "count", "shot", "from", "to", "word", "window", "beats", "half", "video", "compare", "width", "cols", "rows", "out", "all"]);
   const { times, slug } = pickTimes(p, args);
   const video = args.str("video") && resolve(cwd, args.str("video")!);
   const other = args.str("compare") && resolve(cwd, args.str("compare")!);
   const width = args.num("width") ?? 480;
   const cols = args.num("cols") ?? (other ? 2 : 4);
+  const rows = args.num("rows") ?? 6;
+  if (!(cols >= 1) || !(rows >= 1) || !(width >= 16)) throw new CliError("--cols and --rows must be at least 1, --width at least 16");
   const name = (f: string) => basename(f, extname(f));
   const sourceA = video ? basename(video) : "live page";
   const work = mkdtempSync(resolve(tmpdir(), "beatclip-"));
@@ -127,7 +131,7 @@ export async function frames(p: Project, args: Args, cwd: string): Promise<Resul
       const suffix = pages > 1 ? `-${n + 1}of${pages}` : "";
       return explicit ? resolve(dirname(explicit), `${name(explicit)}${suffix}.png`) : uniquePath(p.cfg.out.sheets, `${base}${suffix}`, "png");
     };
-    const sheets = await composeSheets(browser, { title, tiles, cols, width, perSheet: cols * (args.num("rows") ?? 6) }, work, dest);
+    const sheets = await composeSheets(browser, { title, tiles, cols, width, perSheet: cols * rows }, work, dest);
     const data = { sheets, source: sourceA, compare: other ? basename(other) : null, tiles: times.map((t, i) => ({ t, time: fmtTime(t), label: tiles[i].label, ...(diffs ? { diff: round3(diffs[i]), differs: diffs[i] >= p.cfg.differs } : {}) })) };
     const changed = diffs ? `; ${diffs.filter((d) => d >= p.cfg.differs).length} of ${times.length} differ (diff >= ${p.cfg.differs})` : "";
     return { data, text: [...sheets, `${times.length} frames from ${sourceA}${other ? ` beside ${basename(other)}` : ""}: ${fmtTime(times[0])} to ${fmtTime(times.at(-1)!)}${changed}`].join("\n") };

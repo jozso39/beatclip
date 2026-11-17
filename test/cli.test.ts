@@ -1,6 +1,6 @@
 // Runs the real command line against a copy of the demo project: a real page, real screenshots, real ffmpeg.
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -142,6 +142,81 @@ test("notes, proofs, the report, and diff against the ledger", async () => {
   expect(diff.unexplained).toBe(1);
   expect(diff.notesWithoutDifference).toEqual([2]);
   expect((await cli("notes", "set", "1", "nonsense")).code).toBe(1);
+}, 120000);
+
+test("arguments that would silently change what runs are refused", async () => {
+  const refused = async (...args: string[]) => {
+    const r = await cli(...args);
+    expect(r.code).toBe(1);
+    return r.json.error as string;
+  };
+  expect(await refused("render", "3", "6", "--no-encode")).toContain('unexpected argument "3"');
+  expect(await refused("render", "--from", "3", "--tp", "6")).toContain("unknown option --tp");
+  expect(await refused("render", "--notes", "2")).toContain('unexpected argument "2"');
+  expect(await refused("render", "--from", "20", "--to", "30")).toContain("starts past the end");
+  expect(await refused("frames", "--from", "20", "--to", "30")).toContain("none of the asked times");
+  expect(await refused("frames", "--word", "a2.1", "--every", "0")).toContain("must be above 0");
+  expect(await refused("frames", "--shot", "intro", "--shot", "grow")).toContain("given 2 times");
+  expect(await refused("frames", "4", "--cols", "0")).toContain("at least 1");
+  expect(await refused("beat", "4.2", "5.7")).toContain('unexpected argument "5.7"');
+  expect(await refused("beat", "4", "--next", "--prev")).toContain("cannot be used together");
+  expect(await refused("notes", "add", "99", "too late")).toContain("past the end");
+  expect((await cli("at", "12")).json.frame).toBe(359);
+}, 60000);
+
+test("render never overwrites a named draft, and two renders cannot share the cache", async () => {
+  const first = (await cli("render", "--shot", "intro", "--out", "out/named.mp4")).json;
+  expect(first.out).toContain("out/named.mp4");
+  const again = await cli("render", "--shot", "intro", "--out", "out/named.mp4");
+  expect(again.code).toBe(1);
+  expect(again.json.error).toContain("already exists");
+
+  const lock = resolve(dir, "out/cache/frames/.lock");
+  const running = cli("render", "--full", "--no-encode");
+  while (!existsSync(lock)) await Bun.sleep(20);
+  const second = await cli("render", "--shot", "intro", "--no-encode");
+  expect(second.code).toBe(1);
+  expect(second.json.error).toContain("another beatclip render");
+  expect((await running).code).toBe(0);
+  expect(existsSync(lock)).toBe(false);
+}, 120000);
+
+test("an edit that lands after the shoot does not leave two versions of the page in the cache", async () => {
+  recolour("BALL", "#aa00ff");
+  const started = Date.now();
+  const running = cli("render", "--shot", "bounce", "--no-encode");
+  // Wait until the last frame of the range has been written, then change the ball again while the check runs.
+  const last = resolve(dir, "out/cache/frames/000179.jpg");
+  while (statSync(last).mtimeMs < started) await Bun.sleep(10);
+  recolour("BALL", "#00aa44");
+  const result = await running;
+  expect(result.code).toBe(0);
+  expect(result.err).toMatch(/changed while rendering|changed during the shoot/);
+  // Every frame of the cache now shows the second colour: nothing outside "intro" differs from the page.
+  expect((await cli("render", "--shot", "intro", "--no-encode")).json.check.differing).toEqual([]);
+}, 120000);
+
+test("commands running at the same time share the page server and the ledger", async () => {
+  const [sheet, part] = await Promise.all([cli("frames", "--from", "0", "--to", "12", "--every", "0.5"), cli("render", "--shot", "grow", "--no-encode")]);
+  expect(sheet.code).toBe(0);
+  expect(part.code).toBe(0);
+
+  const before = (await cli("notes", "list")).json.length;
+  const [proof, added] = await Promise.all([cli("notes", "proof", "1", "before"), Bun.sleep(150).then(() => cli("notes", "add", "10", "the square should pulse harder"))]);
+  expect(proof.code).toBe(0);
+  expect(added.code).toBe(0);
+  const after = (await cli("notes", "list")).json;
+  expect(after.length).toBe(before + 1);
+  expect(after.find((n: any) => n.id === 1).before.source).toBe("live page");
+}, 120000);
+
+test("diff of drafts of different length compares only what both have", async () => {
+  const whole = (await cli("render", "--shot", "intro")).json.out;
+  const part = (await cli("render", "--shot", "intro", "--excerpt")).json.out;
+  const diff = (await cli("diff", whole, part)).json;
+  expect(diff.frames).toBe(90);
+  expect(diff.ranges).toEqual([]);
+  expect(diff.lengthNote).toContain("only the first 90");
 }, 120000);
 
 test("check: known exceptions pass, new problems fail, probes measure boxes", async () => {
