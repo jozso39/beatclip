@@ -1,8 +1,9 @@
 import { chromium, type Browser, type Page } from "playwright-core";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Config } from "./config";
-import { atExit, processAlive } from "./exit";
+import { atExit, identify, recordAlive, type ProcessId } from "./exit";
 import { scalePicture } from "./ffmpeg";
 import { CliError } from "./time";
 
@@ -25,25 +26,30 @@ async function ensureServer(cfg: Config): Promise<() => void> {
   const serverFile = resolve(cfg.root, ".beatclip", "server.json");
   const me = resolve(users, String(process.pid));
   mkdirSync(users, { recursive: true });
-  writeFileSync(me, "");
+  writeFileSync(me, JSON.stringify(identify(process.pid)));
   const release = atExit(() => {
     rmSync(me, { force: true });
-    for (const pid of readdirSync(users)) if (!processAlive(Number(pid))) rmSync(resolve(users, pid), { force: true });
+    for (const pid of readdirSync(users)) if (!recordAlive(resolve(users, pid))) rmSync(resolve(users, pid), { force: true });
     if (!existsSync(serverFile) || readdirSync(users).length) return;
-    try {
-      process.kill(JSON.parse(readFileSync(serverFile, "utf8")).pid);
-    } catch {}
+    // The whole process group: the start command may be a shell that launched the server as its child.
+    if (recordAlive(serverFile)) process.kill(-(JSON.parse(readFileSync(serverFile, "utf8")) as ProcessId).pid);
     rmSync(serverFile, { force: true });
   });
   try {
+    // A record whose process is gone (or whose pid now belongs to something else) is forgotten, never acted on.
+    if (existsSync(serverFile) && !recordAlive(serverFile) && Date.now() - statSync(serverFile).mtimeMs > 5000) rmSync(serverFile, { force: true });
     if (await reachable(cfg.page.url)) return release;
     if (!cfg.page.start) throw new CliError(`the page does not answer at ${cfg.page.url} (start its server, or set "page.start" in the config)`);
-    // A server file left by a command that died: its server is gone, or the page would answer.
-    if (existsSync(serverFile) && !processAlive(JSON.parse(readFileSync(serverFile, "utf8")).pid)) rmSync(serverFile, { force: true });
-    if (!existsSync(serverFile)) {
-      const proc = Bun.spawn(["sh", "-c", cfg.page.start], { cwd: cfg.root, stdout: "ignore", stderr: "inherit" });
-      proc.unref();
-      writeFileSync(serverFile, JSON.stringify({ pid: proc.pid }));
+    // Only the command that manages to create the record starts the server; the others wait for it.
+    let fd: number | null = null;
+    try {
+      fd = openSync(serverFile, "wx");
+    } catch {}
+    if (fd !== null) {
+      const child = spawn("sh", ["-c", cfg.page.start], { cwd: cfg.root, detached: true, stdio: ["ignore", "ignore", "inherit"] });
+      child.unref();
+      writeSync(fd, JSON.stringify(identify(child.pid!)));
+      closeSync(fd);
     }
     for (let i = 0; i < 150; i++) {
       if (await reachable(cfg.page.url)) return release;

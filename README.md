@@ -15,7 +15,7 @@ It is for videos where a web page draws every frame as a pure function of the so
 
 ## Install
 
-Needs [Bun](https://bun.sh), Google Chrome, and `ffmpeg` and `ffprobe` on the PATH.
+Needs [Bun](https://bun.sh), Google Chrome, and `ffmpeg` and `ffprobe` on the PATH. Developed on macOS; it should run on Linux, and it is not written for Windows (it uses `sh` and `ps`).
 
 ```bash
 git clone https://github.com/jozso39/beatclip.git
@@ -94,7 +94,7 @@ For `check`, each lyric word needs an element that a CSS selector can find from 
 | `page.url`, `page.width`, `page.height` | The page to drive and its frame size. |
 | `page.ready`, `page.seek`, `page.duration` | Hook names; default `__ready`, `__seek`, `__duration`. |
 | `page.shots` | Name of the shot-list hook. Or leave it out and list the shots yourself: `"shots": [{ "id": "intro", "s": 0 }]`. |
-| `page.start` | Command that starts the page's server when the URL does not answer (optional). It is stopped again when the command ends. |
+| `page.start` | Command that starts the page's server when the URL does not answer (optional). It is stopped when the last beatclip command using it ends; a server you started yourself is never stopped. |
 | `page.channel` | Browser channel for playwright-core, default `chrome`. |
 | `fps` | Frames per second of the video, default 60. |
 | `duration` | Length in seconds. Optional: otherwise read from the page hook (and cached with the shot list). |
@@ -194,7 +194,7 @@ Sheets are written to `out/sheets/<timestamp>-<what>.png`, a new name every time
 
 ```
 $ beatclip frames 4 --video out/missing.mp4
-beatclip: no such video: out/missing.mp4
+beatclip: no such video: /path/to/project/out/missing.mp4
 ```
 
 ### `beatclip render`
@@ -246,7 +246,7 @@ total        2.2 s
 
 Things it takes care of:
 
-- **A dev server that is reloading.** Before shooting it waits until no file in `sources` has changed for `render.settleMs`. If the page reloads while it is shooting, it waits and shoots those frames again instead of dying. If a source file changes at any point of the render (while shooting, checking or widening), every range shot so far is shot again, so the cache never keeps frames of two versions of the code. This guard works from the files listed in `sources`: list everything the picture depends on.
+- **A dev server that is reloading.** Before shooting it waits until no file in `sources` has changed for `render.settleMs`. If the page reloads while it is shooting, it waits and shoots those frames again instead of dying. If a source file is added, removed or modified in any way at any point of the render (while shooting, checking or widening), every range shot so far is shot again, so the cache never keeps frames of two versions of the code. This guard works from the files listed in `sources`: list everything the picture depends on.
 - **Two renders at once.** A lock in the cache folder lets only one render write a project's cache; the second one stops with an error. Other commands (`frames`, `check`, `notes`) can run alongside a render and share a page server started through `page.start`; it is stopped by whichever command finishes last.
 - **A cache that cannot be used.** With no cache yet, an incomplete one, or one shot with another size, frame rate, quality or URL, a partial render becomes a full one and says why.
 - **An interrupted partial render.** The ranges being re-shot are recorded and shot again with the next render.
@@ -254,7 +254,7 @@ Things it takes care of:
 - **Output.** `{n}` in the video name is the first free number. A name without `{n}` that already exists is refused before anything is shot, so a draft is never overwritten. The file appears only when ffmpeg succeeded.
 - **A video that got shorter.** A full render removes cached frames past the new end.
 
-Other options: `--full`, `--out <file>`, `--no-encode` (update the cache only), `--no-verify` (skip the check), `--no-widen` (fail instead of widening). The time each part took is always printed.
+Other options: `--full`, `--out <file>` (not with `--excerpt` or `--no-encode`), `--no-encode` (update the cache only), `--no-verify` (skip the check), `--no-widen` (fail instead of widening). The time each part took is always printed.
 
 ### `beatclip notes`
 

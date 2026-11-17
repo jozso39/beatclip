@@ -85,6 +85,7 @@ export function beat(p: Project, args: Args): Result {
   let from: number | undefined;
   if (args.has("n")) {
     if (rest.length) throw new CliError(`unexpected argument "${rest[0]}" with --n`);
+    if (args.has("next") || args.has("prev")) throw new CliError("--next and --prev need a time, not --n (use +1 or -1 to move from beat --n)");
     n = args.num("n")!;
   } else {
     if (rest.length > 1) throw new CliError(`unexpected argument "${rest[1]}" (beat takes one time)`);

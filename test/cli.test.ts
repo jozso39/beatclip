@@ -1,6 +1,6 @@
 // Runs the real command line against a copy of the demo project: a real page, real screenshots, real ffmpeg.
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -20,13 +20,16 @@ function recolour(name: string, colour: string) {
   writeFileSync(file, readFileSync(file, "utf8").replace(new RegExp(`const ${name} = "#\\w+"`), `const ${name} = "${colour}"`));
 }
 
+const serverUp = () => fetch(`http://localhost:${PORT}/index.html`).then(() => true, () => false);
+
 const sheets = () => (existsSync(resolve(dir, "out/sheets")) ? readdirSync(resolve(dir, "out/sheets")) : []);
 
 beforeAll(async () => {
   dir = mkdtempSync(resolve(tmpdir(), "beatclip-test-"));
   cpSync(resolve(import.meta.dir, "../demo"), dir, { recursive: true, filter: (src) => !/\/(out|audio|\.beatclip)$/.test(src) && !src.endsWith("beatclip.notes.json") });
   const config = resolve(dir, "beatclip.config.json");
-  writeFileSync(config, readFileSync(config, "utf8").replaceAll("5210", String(PORT)));
+  // The start command is a shell line whose server is a child of the shell, as "cd app && npm run dev" would be.
+  writeFileSync(config, readFileSync(config, "utf8").replaceAll("5210", String(PORT)).replace('"bun serve.ts', '"cd . && bun serve.ts'));
   await Bun.spawn(["bun", resolve(dir, "make-audio.ts")], { stdout: "ignore" }).exited;
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -161,6 +164,11 @@ test("arguments that would silently change what runs are refused", async () => {
   expect(await refused("beat", "4.2", "5.7")).toContain('unexpected argument "5.7"');
   expect(await refused("beat", "4", "--next", "--prev")).toContain("cannot be used together");
   expect(await refused("notes", "add", "99", "too late")).toContain("past the end");
+  expect(await refused("notes", "add", "4", "x", "--status", "done")).toContain("unknown option --status");
+  expect(await refused("probe", "ball", "3.5", "--from", "3", "--to", "3.1")).toContain("not both");
+  expect(await refused("frames", "4", "--half")).toContain("only applies with --beats");
+  expect(await refused("render", "--no-encode", "--out", "x.mp4")).toContain("cannot be combined");
+  expect(await refused("beat", "--n", "8", "--next")).toContain("need a time");
   expect((await cli("at", "12")).json.frame).toBe(359);
 }, 60000);
 
@@ -189,6 +197,9 @@ test("an edit that lands after the shoot does not leave two versions of the page
   const last = resolve(dir, "out/cache/frames/000179.jpg");
   while (statSync(last).mtimeMs < started) await Bun.sleep(10);
   recolour("BALL", "#00aa44");
+  // Even an edit that leaves the file looking older than before (cp -p, rsync -t, an unpacked archive) must count.
+  const old = new Date(Date.now() - 3600_000);
+  utimesSync(resolve(dir, "scene.js"), old, old);
   const result = await running;
   expect(result.code).toBe(0);
   expect(result.err).toMatch(/changed while rendering|changed during the shoot/);
@@ -200,6 +211,20 @@ test("commands running at the same time share the page server and the ledger", a
   const [sheet, part] = await Promise.all([cli("frames", "--from", "0", "--to", "12", "--every", "0.5"), cli("render", "--shot", "grow", "--no-encode")]);
   expect(sheet.code).toBe(0);
   expect(part.code).toBe(0);
+  // Both started cold; whoever finished last stopped the one server, shell child included.
+  expect(await serverUp()).toBe(false);
+  expect(existsSync(resolve(dir, ".beatclip/server.json"))).toBe(false);
+
+  // A record left by a crashed command whose pid now belongs to something else must not get that process killed.
+  const bystander = Bun.spawn(["sleep", "30"]);
+  writeFileSync(resolve(dir, ".beatclip/server.json"), JSON.stringify({ pid: bystander.pid, started: "Thu Jan  1 00:00:00 1970" }));
+  const stale = new Date(Date.now() - 60_000);
+  utimesSync(resolve(dir, ".beatclip/server.json"), stale, stale);
+  expect((await cli("frames", "4")).code).toBe(0);
+  expect(bystander.killed).toBe(false);
+  expect(bystander.exitCode).toBeNull();
+  bystander.kill();
+  expect(await serverUp()).toBe(false);
 
   const before = (await cli("notes", "list")).json.length;
   const [proof, added] = await Promise.all([cli("notes", "proof", "1", "before"), Bun.sleep(150).then(() => cli("notes", "add", "10", "the square should pulse harder"))]);
@@ -217,6 +242,8 @@ test("diff of drafts of different length compares only what both have", async ()
   expect(diff.frames).toBe(90);
   expect(diff.ranges).toEqual([]);
   expect(diff.lengthNote).toContain("only the first 90");
+  // The done notes at 0:04 and 0:07 lie outside the three seconds compared: nothing may be claimed about them.
+  expect(diff.notesWithoutDifference).toEqual([]);
 }, 120000);
 
 test("check: known exceptions pass, new problems fail, probes measure boxes", async () => {

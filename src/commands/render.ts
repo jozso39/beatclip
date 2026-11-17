@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, openSync, closeSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import type { Page } from "playwright-core";
@@ -6,8 +6,8 @@ import type { Args } from "../args";
 import { openSession, shootJpeg, type Session } from "../browser";
 import type { Config } from "../config";
 import { difference, must, pool } from "../ffmpeg";
-import { atExit, processAlive } from "../exit";
-import { frameCount, newestSource, shotAt, shotById, type Project } from "../project";
+import { atExit, identify, recordAlive, type ProcessId } from "../exit";
+import { changedSource, frameCount, lastSourceChange, shotAt, shotById, snapshotSources, type Project } from "../project";
 import { CliError, fmtSpan, fmtTime, parseTime, round3 } from "../time";
 import type { Result } from "./lookup";
 import { loadNotes, noteById, noteRange, pendingNotes } from "./notes";
@@ -62,15 +62,20 @@ function lockCache(cfg: Config): () => void {
   const file = resolve(cfg.out.cache, ".lock");
   mkdirSync(cfg.out.cache, { recursive: true });
   for (let tries = 0; tries < 2; tries++) {
+    let fd: number;
     try {
-      closeSync(openSync(file, "wx"));
-      writeFileSync(file, String(process.pid));
-      return atExit(() => rmSync(file, { force: true }));
+      fd = openSync(file, "wx");
     } catch {
-      const owner = Number(readFileSync(file, "utf8"));
-      if (owner && processAlive(owner)) throw new CliError(`another beatclip render is using this frame cache (process ${owner}); wait for it to finish`);
+      // An empty lock is one being written right now, unless it has sat there for a while.
+      const text = readFileSync(file, "utf8");
+      const fresh = !text && Date.now() - statSync(file).mtimeMs < 5000;
+      if (recordAlive(file) || fresh) throw new CliError(`another beatclip render is using this frame cache${text ? ` (process ${(JSON.parse(text) as ProcessId).pid})` : ""}; wait for it to finish`);
       rmSync(file, { force: true });
+      continue;
     }
+    writeSync(fd, JSON.stringify(identify(process.pid)));
+    closeSync(fd);
+    return atExit(() => rmSync(file, { force: true }));
   }
   throw new CliError(`cannot lock the frame cache at ${file}`);
 }
@@ -95,7 +100,7 @@ const isReload = (e: unknown) => RELOAD.test((e as Error).message) && !/net::ERR
  */
 async function shootOnce(session: Session, p: Project, frames: number[], sink: (frame: number, jpeg: Buffer) => Promise<unknown>, tick: () => void): Promise<string | null> {
   const cfg = p.cfg;
-  const started = Date.now();
+  const before = snapshotSources(cfg);
   let stop: string | null = null;
   let next = 0;
   await Promise.all(
@@ -122,33 +127,33 @@ async function shootOnce(session: Session, p: Project, frames: number[], sink: (
       }
     }),
   );
-  if (!stop && cfg.sources.length) {
-    const newest = newestSource(cfg);
-    if (newest.mtime > started) stop = `${relative(cfg.root, newest.file)} changed during the shoot`;
-  }
+  const changed = stop ? null : changedSource(before, snapshotSources(cfg));
+  if (changed) stop = `${changed} changed during the shoot`;
   return stop;
 }
 
 /** Waits until no source file has changed for `settleMs`, so the dev server has finished reloading. */
 async function settle(cfg: Config) {
   if (!cfg.sources.length) return;
-  for (;;) {
-    const age = Date.now() - newestSource(cfg).mtime;
+  for (let said = false; ; ) {
+    const age = Date.now() - lastSourceChange(cfg);
     if (age >= cfg.render.settleMs) return;
+    if (!said) console.error("render: a source file has just changed; waiting for the page to settle");
+    said = true;
     await Bun.sleep(cfg.render.settleMs - age + 50);
   }
 }
 
 const ATTEMPTS = 4;
 
-/** Changes whenever a source file does (0 when the config names no sources). */
-const sourceStamp = (cfg: Config) => (cfg.sources.length ? newestSource(cfg).mtime : 0);
+/** A value that changes whenever a source file is added, removed or modified in any way. */
+const sourceStamp = (cfg: Config) => JSON.stringify([...snapshotSources(cfg)]);
 
 /**
  * Shoots frames, starting over (all of them) whenever the page changed underneath.
  * Returns how many times it had to start over and the source stamp all the frames were shot at.
  */
-async function shoot(session: Session, p: Project, frames: number[], sink: (frame: number, jpeg: Buffer) => Promise<unknown>, label: string): Promise<{ restarts: number; stamp: number }> {
+async function shoot(session: Session, p: Project, frames: number[], sink: (frame: number, jpeg: Buffer) => Promise<unknown>, label: string): Promise<{ restarts: number; stamp: string }> {
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     await settle(p.cfg);
     const stamp = sourceStamp(p.cfg);
@@ -344,7 +349,7 @@ async function shootChecked(session: Session, p: Project, start: Range[], fullBe
 
   save(false);
   // The source stamp every frame of `out.ranges` in the cache was shot at; null until the first shoot.
-  let stamp: number | null = null;
+  let stamp: string | null = null;
   let todo = framesOf(out.ranges);
   for (let widenings = 0, redone = 0; ; ) {
     const started = Date.now();
@@ -403,6 +408,7 @@ const secs = (ms: number) => Math.round(ms / 100) / 10;
 export async function render(p: Project, args: Args, cwd: string): Promise<Result> {
   args.allow(["notes", "full", "out", "no-encode", "no-verify", "no-widen", "excerpt"], ["from", "to", "shot", "note"]);
   args.noMore();
+  if (args.has("out") && (args.has("no-encode") || args.has("excerpt"))) throw new CliError("--out cannot be combined with --no-encode or --excerpt (an excerpt gets its own name next to the videos)");
   const cfg = p.cfg;
   const total = frameCount(p);
   const asked = requestedRanges(p, args);

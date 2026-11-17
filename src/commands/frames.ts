@@ -24,6 +24,9 @@ function spread(a: number, b: number, every: number | undefined, count: number):
 
 /** The times the arguments ask for, snapped to video frames, in order, without repeats. */
 export function pickTimes(p: Project, args: Args): { times: number[]; slug: string } {
+  if (args.has("half") && !args.has("beats")) throw new CliError("--half only applies with --beats");
+  if (args.has("window") && !args.has("word")) throw new CliError("--window only applies with --word");
+  if (args.has("count") && args.has("every")) throw new CliError("give --count or --every, not both");
   const every = args.num("every");
   const count = args.num("count") ?? 12;
   const times: number[] = args.rest.map(parseTime);

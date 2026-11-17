@@ -103,14 +103,26 @@ export function sourceFiles(cfg: Config): string[] {
   return cfg.sources.flatMap((g) => [...new Bun.Glob(g).scanSync({ cwd: cfg.root, onlyFiles: true })].map((f) => resolve(cfg.root, f)));
 }
 
-/** The most recently changed source file (the config itself counts). */
-export function newestSource(cfg: Config): { mtime: number; file: string } {
-  let best = { mtime: statSync(cfg.file).mtimeMs, file: cfg.file };
-  for (const file of sourceFiles(cfg)) {
-    const mtime = statSync(file).mtimeMs;
-    if (mtime > best.mtime) best = { mtime, file };
-  }
-  return best;
+/** Every source file (and the config) with its modification time and size: what the picture was made from. */
+export function snapshotSources(cfg: Config): Map<string, string> {
+  const of = (file: string) => {
+    const st = statSync(file);
+    return `${st.mtimeMs}:${st.size}`;
+  };
+  return new Map([cfg.file, ...sourceFiles(cfg).sort()].map((file) => [relative(cfg.root, file), of(file)]));
+}
+
+/** The first file that was added, removed or modified between two snapshots, or null when they are the same. */
+export function changedSource(before: Map<string, string>, after: Map<string, string>): string | null {
+  for (const [file, state] of after) if (before.get(file) !== state) return file;
+  for (const file of before.keys()) if (!after.has(file)) return file;
+  return null;
+}
+
+/** When a source file last changed (a time in the future, from a wrong clock or an unpacked archive, counts as now). */
+export function lastSourceChange(cfg: Config): number {
+  const times = [cfg.file, ...sourceFiles(cfg)].map((f) => statSync(f).mtimeMs);
+  return Math.min(Date.now(), Math.max(...times));
 }
 
 interface Facts {
@@ -123,10 +135,10 @@ async function loadFacts(cfg: Config): Promise<Facts> {
   if (cfg.shots && cfg.duration !== undefined) return { shots: cfg.shots, duration: cfg.duration };
   if (!cfg.shots && !cfg.page.shots) throw new CliError(`the config needs "shots" (a list) or "page.shots" (the name of a window hook)`);
   const cacheFile = resolve(cfg.root, ".beatclip", "page.json");
-  const newest = newestSource(cfg).mtime;
+  const sources = JSON.stringify([...snapshotSources(cfg)]);
   if (cfg.sources.length && existsSync(cacheFile)) {
     const c = JSON.parse(readFileSync(cacheFile, "utf8"));
-    if (c.url === cfg.page.url && c.stamp >= newest) return c.facts;
+    if (c.url === cfg.page.url && c.sources === sources) return c.facts;
   }
   const facts = await withSession(cfg, async (s) => {
     const page = await s.open();
@@ -137,7 +149,7 @@ async function loadFacts(cfg: Config): Promise<Facts> {
     return { duration, shots: shots.map(({ id, s, file }) => ({ id, s, file })) };
   });
   mkdirSync(resolve(cfg.root, ".beatclip"), { recursive: true });
-  writeFileSync(cacheFile, JSON.stringify({ url: cfg.page.url, stamp: Date.now(), facts }));
+  writeFileSync(cacheFile, JSON.stringify({ url: cfg.page.url, sources, facts }));
   return facts;
 }
 

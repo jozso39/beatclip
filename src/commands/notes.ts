@@ -128,9 +128,11 @@ function endTime(p: Project, args: Args, start: number): number | undefined {
 
 /** `notes add|list|set|proof|remove|report`: the ledger tying each note to its time, status and proof frames. */
 export async function notes(p: Project, args: Args, cwd: string): Promise<Result> {
-  args.allow(["to", "status", "shows", "text", "video", "at", "out"]);
   const cfg = p.cfg;
   const action = args.rest.shift() ?? "list";
+  const options: Record<string, string[]> = { add: ["to"], list: ["status"], set: ["shows", "text", "to"], proof: ["video", "at"], remove: [], report: ["out"] };
+  if (!options[action]) throw new CliError(`unknown notes action "${action}" (${Object.keys(options).join(", ")})`);
+  args.allow(options[action]);
 
   if (action === "add") {
     const t = parseTime(args.take("the note's time (beatclip notes add 1:07 \"the ball should land on the beat\")"));
@@ -198,14 +200,11 @@ export async function notes(p: Project, args: Args, cwd: string): Promise<Result
     return { data: note, text: `removed note #${note.id}` };
   }
 
-  if (action === "report") {
-    args.noMore();
-    const all = loadNotes(cfg);
-    const out = args.str("out") && resolve(cwd, args.str("out")!);
-    const md = reportMarkdown(p, all, out ? dirname(out) : cfg.root);
-    if (out) writeFileSync(out, md + "\n");
-    return { data: { file: out ?? null, notes: all, markdown: md }, text: out ? `${md}\n\nwrote ${out}` : md };
-  }
-
-  throw new CliError(`unknown notes action "${action}" (add, list, set, proof, remove, report)`);
+  // report
+  args.noMore();
+  const all = loadNotes(cfg);
+  const out = args.str("out") && resolve(cwd, args.str("out")!);
+  const md = reportMarkdown(p, all, out ? dirname(out) : cfg.root);
+  if (out) writeFileSync(out, md + "\n");
+  return { data: { file: out ?? null, notes: all, markdown: md }, text: out ? `${md}\n\nwrote ${out}` : md };
 }

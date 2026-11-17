@@ -214,6 +214,8 @@ export async function probe(p: Project, args: Args): Promise<Result> {
   args.allow(["selector", "from", "to", "lowest", "highest", "half"]);
   const selector = args.str("selector") ?? probeSelector(args.take("a probe name (or --selector <css>)"));
   const range = args.has("from") || args.has("to");
+  if (range && args.rest.length) throw new CliError(`give times or --from/--to, not both (unexpected "${args.rest[0]}")`);
+  if (!range && (args.has("lowest") || args.has("highest"))) throw new CliError("--lowest and --highest need a range (--from/--to)");
   const times = range ? frameTimes(p, args.time("from") ?? 0, args.time("to") ?? p.duration) : args.rest.map(parseTime);
   if (!times.length) throw new CliError("which times? give times, or --from/--to");
   const boxes = await withSession(p.cfg, async (s) => (await measure(await s.open(), p.cfg, times.map((t) => ({ selector, t })))).map(union));

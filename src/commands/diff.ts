@@ -58,7 +58,9 @@ export async function diff(p: Project, args: Args, cwd: string): Promise<Result>
   }));
   // A note accounts for a range anywhere in its shot, but it only "shows" when something differs right where it points.
   const near = (n: Note): [number, number] => (n.to !== undefined ? [n.t, n.to] : [n.t - NEAR, n.t + NEAR]);
-  const silent = notes.filter((n) => n.status !== "open" && !ranges.some((range) => overlaps(near(n), [range.from, range.to])));
+  // Only notes inside the compared stretch can be judged (the drafts may differ in length).
+  const compared: [number, number] = [0, diffs.length / ia.fps];
+  const silent = notes.filter((n) => n.status !== "open" && overlaps(near(n), compared) && !ranges.some((range) => overlaps(near(n), [range.from, range.to])));
   const lengthNote = ia.frames === ib.frames ? null : `${basename(a)} has ${ia.frames} frames, ${basename(b)} has ${ib.frames}; only the first ${diffs.length} could be compared`;
 
   const rows = explained.map((x) => {
