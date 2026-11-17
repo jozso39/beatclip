@@ -49,13 +49,32 @@ export async function probeVideo(file: string): Promise<VideoInfo> {
   return { width: st.width, height: st.height, fps, duration, frames: Number(st.nb_frames) || Math.round(duration * fps) };
 }
 
-/** Writes the frame shown at time `t` of a video as a JPEG scaled to `width`. */
-export async function grabFrame(video: string, info: VideoInfo, t: number, width: number, out: string): Promise<void> {
+/**
+ * A JPEG has no colour tags; it is read as full-range BT.601. A frame taken out of a BT.709 video must be converted
+ * to that on the way, or its colours come out shifted in every picture made from it.
+ */
+const AS_JPEG = "out_color_matrix=bt601:out_range=pc";
+
+/** A rectangle in the page's own pixels (the stage), for looking at one small element. */
+export interface Crop {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * Writes the frame shown at time `t` of a video as a JPEG scaled to `width`. `crop` cuts a rectangle out first;
+ * it is given in page pixels and `pageWidth` says how wide the page is, so it lands right in a video of any scale.
+ */
+export async function grabFrame(video: string, info: VideoInfo, t: number, width: number, out: string, crop?: Crop, pageWidth = info.width): Promise<void> {
   const frame = Math.round(t * info.fps);
   if (frame < 0 || frame >= info.frames) throw new CliError(`${video} has no frame at ${t.toFixed(2)} s (it is ${info.duration.toFixed(2)} s long)`);
   // Seeking a hair before the frame's timestamp makes ffmpeg return exactly that frame.
   const at = Math.max(0, frame / info.fps - 0.25 / info.fps);
-  await must(["ffmpeg", "-y", "-loglevel", "error", "-ss", at.toFixed(5), "-i", video, "-frames:v", "1", "-vf", `scale=${width}:-2`, "-q:v", "3", out], `reading a frame of ${video}`);
+  const k = info.width / pageWidth;
+  const cut = crop ? `crop=${Math.round(crop.w * k)}:${Math.round(crop.h * k)}:${Math.round(crop.x * k)}:${Math.round(crop.y * k)},` : "";
+  await must(["ffmpeg", "-y", "-loglevel", "error", "-ss", at.toFixed(5), "-i", video, "-frames:v", "1", "-vf", `${cut}scale=${width}:-2:${AS_JPEG}`, "-q:v", "3", out], `reading a frame of ${video}`);
   if (!existsSync(out) || statSync(out).size === 0) throw new CliError(`ffmpeg wrote no frame for ${t.toFixed(2)} s of ${video}`);
 }
 
@@ -65,25 +84,29 @@ export async function scalePicture(src: string, width: number, out: string): Pro
 }
 
 /**
- * The filter that measures how different two inputs are, frame by frame: both are scaled to 480 px wide,
+ * The filter that measures how different two inputs are, frame by frame: both are scaled to `width` px wide,
  * subtracted in RGB, averaged over 8x8 blocks, and the largest block average is printed (0 = identical, 255 = black against white).
  * Unlike a whole-frame score it stays sensitive to a small element that changed, and it ignores compression noise (below about 4).
  */
-function differenceFilter(aspect: number): string {
-  const size = `scale=480:${Math.round(480 / aspect / 8) * 8}`;
+function differenceFilter(aspect: number, width: number): string {
+  const size = `scale=${width}:${Math.max(8, Math.round(width / aspect / 8) * 8)}`;
   return `[0:v]${size},format=gbrp[a];[1:v]${size},format=gbrp[b];[a][b]blend=all_mode=difference:shortest=1,format=gray,scale=iw/8:ih/8:flags=area,signalstats,metadata=print:key=lavfi.signalstats.YMAX:file=-`;
 }
 
-/** Difference of every frame of two videos, up to the end of the shorter one (or of two pictures: one value). `aspect` is width / height. */
-export async function differences(a: string, b: string, aspect: number): Promise<number[]> {
-  const r = await must(["ffmpeg", "-loglevel", "error", "-i", a, "-i", b, "-lavfi", differenceFilter(aspect), "-f", "null", "-"], `comparing ${a} with ${b}`);
+/**
+ * Difference of every frame of two videos, up to the end of the shorter one (or of two pictures: one value).
+ * `aspect` is width / height. `width` is the size they are compared at: 480 for whole frames, less for a small
+ * crop, which must not be blown up first (that would turn compression noise into differences).
+ */
+export async function differences(a: string, b: string, aspect: number, width = 480): Promise<number[]> {
+  const r = await must(["ffmpeg", "-loglevel", "error", "-i", a, "-i", b, "-lavfi", differenceFilter(aspect, width), "-f", "null", "-"], `comparing ${a} with ${b}`);
   const values = [...r.stdout.matchAll(/YMAX=([\d.]+)/g)].map((m) => Number(m[1]));
   if (!values.length) throw new CliError(`ffmpeg compared no frames of ${a} and ${b}`);
   return values;
 }
 
 /** Difference of two pictures, 0 (identical) to 255. */
-export const difference = async (a: string, b: string, aspect: number) => (await differences(a, b, aspect))[0];
+export const difference = async (a: string, b: string, aspect: number, width = 480) => (await differences(a, b, aspect, width))[0];
 
 /** Runs `fn` over `items` with at most `limit` running at once, keeping order. */
 export async function pool<T, R>(items: T[], limit: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {

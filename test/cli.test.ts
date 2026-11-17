@@ -22,6 +22,10 @@ function recolour(name: string, colour: string) {
 
 const serverUp = () => fetch(`http://localhost:${PORT}/index.html`).then(() => true, () => false);
 
+/** One line of ffprobe output for the video stream of a file. */
+const probe = (file: string, entries: string) =>
+  Bun.spawnSync(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", `stream=${entries}`, "-of", "csv=p=0", file]).stdout.toString().trim().replace(/,$/, "");
+
 const sheets = () => (existsSync(resolve(dir, "out/sheets")) ? readdirSync(resolve(dir, "out/sheets")) : []);
 
 beforeAll(async () => {
@@ -98,10 +102,20 @@ test("render: full, partial from the cache, and a stale cache is caught and wide
   expect(part.check.differing).toEqual([]);
   expect(part.out).not.toBe(full.out);
 
+  // Limited-range BT.709, tagged, so players do not have to guess; all frames there after the join.
+  expect(probe(full.out, "pix_fmt,color_range,color_space,color_transfer,color_primaries,nb_frames")).toBe("yuv420p,tv,bt709,bt709,bt709,360");
+  expect(full.segments).toEqual({ segments: 3, encoded: 3 });
+  // Nothing changed in "bounce": its frames come out the same, so no segment is encoded again.
+  expect(part.segments).toEqual({ segments: 3, encoded: 0 });
+  // The joined segments and a one-pass encode of the same frames are the same video.
+  const whole = (await cli("render", "--shot", "bounce", "--whole")).json;
+  expect(whole.segments).toBeNull();
+  expect((await cli("diff", part.out, whole.out, "--threshold", "6")).json.ranges).toEqual([]);
+
   const quick = (await cli("render", "--shot", "bounce", "--excerpt")).json;
   expect(quick.out).toContain("excerpt-3.00-6.00-1.mp4");
-  const probe = Bun.spawnSync(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "csv=p=0", quick.out]);
-  expect(parseInt(probe.stdout.toString())).toBe(90);
+  expect(probe(quick.out, "nb_frames")).toBe("90");
+  expect(probe(quick.out, "color_space")).toBe("bt709");
 
   // The square is in "intro" and "finale"; only the first second is asked for, so the check has to widen to both shots.
   recolour("SQUARE", "#ff00ff");
@@ -160,7 +174,7 @@ test("notes, proofs, the report, and diff against the ledger", async () => {
   expect(proof.diff).toBeGreaterThan(20);
   await cli("notes", "set", "1", "done", "--shows", "an orange ball on the floor line");
   const report = (await cli("notes", "report")).json.markdown as string;
-  expect(report).toContain("| 1 | the ball should be orange | 0:04.00 | bounce | done | an orange ball on the floor line | [before](out/proofs/");
+  expect(report).toMatch(/\| 1 \| the ball should be orange \| 0:04.00 \| bounce \| done in demo-\d+\.mp4 \| an orange ball on the floor line \| before \[0:04.00\]\(out\/proofs\//);
   expect(report).toContain("| 2 | bar grows too slowly | 0:07.00–0:08.50 | grow | open |");
 
   // Note 2 is marked done although nothing changed there: diff has to say so.
@@ -267,7 +281,7 @@ test("commands running at the same time share the page server and the ledger", a
   expect(added.code).toBe(0);
   const after = (await cli("notes", "list")).json;
   expect(after.length).toBe(before + 1);
-  expect(after.find((n: any) => n.id === 1).before.source).toBe("live page");
+  expect(after.find((n: any) => n.id === 1).before[0].source).toBe("live page");
 }, 120000);
 
 test("diff of drafts of different length compares only what both have", async () => {
@@ -280,6 +294,93 @@ test("diff of drafts of different length compares only what both have", async ()
   // The done notes at 0:04 and 0:07 lie outside the three seconds compared: nothing may be claimed about them.
   expect(diff.notesWithoutDifference).toEqual([]);
 }, 120000);
+
+test("render --changed finds the shots an edit touched, and a segment is encoded only where frames changed", async () => {
+  await cli("render", "--full", "--no-encode");
+  expect((await cli("render", "--changed")).json).toMatchObject({ kind: "none", out: null });
+
+  // The bar is in "grow" (6-9 s) and "finale" (9-12 s): two of the three four-second segments.
+  recolour("BAR", "#123456");
+  const changed = (await cli("render", "--changed")).json;
+  expect(changed.scan.shots).toEqual(["grow", "finale"]);
+  expect(changed.rendered).toEqual([{ from: 6, to: 12 }]);
+  expect(changed.segments).toEqual({ segments: 3, encoded: 2 });
+  expect(probe(changed.out, "nb_frames")).toBe("360");
+  expect((await cli("render", "--changed")).json.kind).toBe("none");
+  expect((await cli("render", "--changed", "--shot", "intro")).json.error).toContain("finds the ranges itself");
+}, 120000);
+
+test("a profile renders at its own scale into its own cache and leaves the base cache alone", async () => {
+  const config = resolve(dir, "beatclip.config.json");
+  const base = readFileSync(config, "utf8");
+  writeFileSync(config, base.replace('"fps": 30,', '"fps": 30,\n  "profiles": { "big": { "render": { "scale": 2 } } },'));
+  const doctor = (await cli("doctor", "--profile", "big")).json;
+  expect(doctor.checks.find((c: any) => c.what === "canvases at scale 2").level).toBe("ok");
+
+  const big = await cli("render", "--shot", "intro", "--profile", "big", "--drop-cache");
+  expect(big.json.kind).toBe("full");
+  expect(big.err).toContain("the frame cache will take about");
+  expect(big.json.out).toMatch(/demo-big-1\.mp4$/);
+  expect(probe(big.json.out, "width,height")).toBe("1280,720");
+  expect(big.json.cacheDropped).toBe(true);
+  expect(existsSync(resolve(dir, "out/cache/frames-big"))).toBe(false);
+  // The base cache is still complete: a partial render of it stays partial.
+  expect((await cli("render", "--shot", "intro", "--no-encode")).json.kind).toBe("partial");
+  expect((await cli("at", "4", "--profile", "nope")).json.error).toContain('no profile "nope"');
+}, 120000);
+
+test("frames: a crop, a capped sheet width, and waiting after a source edit", async () => {
+  const draft = (await cli("render", "--shot", "intro")).json.out;
+  const crop = (await cli("frames", "--shot", "bounce", "--beats", "--crop", "270,90,100,220", "--compare", draft)).json;
+  expect(crop.crop).toEqual({ x: 270, y: 90, w: 100, h: 220 });
+  expect(crop.tiles.map((t: any) => t.differs)).toEqual([false, false, false, false, false, false]);
+  expect((await cli("frames", "4", "--crop", "600,0,100,100")).json.error).toContain("--crop is x,y,w,h");
+
+  const wide = (await cli("frames", "--from", "0", "--to", "12", "--every", "1", "--compare", draft, "--cols", "4", "--width", "620")).json;
+  expect(wide.layout).toMatchObject({ cols: 1, width: 620 });
+  expect(wide.layout.adjusted).toContain("within 2000 px");
+  expect(readFileSync(wide.sheets[0]).readUInt32BE(16)).toBeLessThanOrEqual(2000);
+
+  // Right after an edit the page may be reloading: the command waits instead of reading it half-loaded.
+  recolour("SQUARE", "#0f0f0f");
+  const soon = await cli("frames", "1");
+  expect(soon.code).toBe(0);
+  expect(soon.err).toContain("waiting for the page to settle");
+}, 120000);
+
+test("notes: several proof frames, several notes at once, drafts and superseded notes", async () => {
+  const total = (await cli("notes", "list")).json.length;
+  const a = (await cli("notes", "add", "4.5", "the ball should squash when it lands")).json.note.id;
+  const b = (await cli("notes", "add", "5", "the ball should squash more")).json.note.id;
+  expect([a, b]).toEqual([total + 1, total + 2]);
+  const old = (await cli("render", "--shot", "intro")).json.out;
+
+  const before = (await cli("notes", "proof", String(a), "before", "--video", old, "--at", "4.25", "--at", "4.5", "--at", "4.75")).json;
+  expect(before.before.map((p: any) => p.t)).toEqual([4.25, 4.5, 4.75]);
+  expect((await cli("notes", "proof", `${a}-${b}`, "before", "--at", "4")).json.error).toContain("one note");
+  const both = (await cli("notes", "proof", `${a},${b}`, "before", "--video", old)).json;
+  expect(both.map((n: any) => n.before.length)).toEqual([1, 1]);
+
+  recolour("BALL", "#ff0066");
+  const fresh = (await cli("render", "--changed")).json.out;
+  const after = (await cli("notes", "proof", String(a), "after", "--video", fresh)).json;
+  expect(after.doneIn).toMatch(/demo-\d+\.mp4$/);
+  expect(after.diff).toBeGreaterThan(20);
+
+  expect((await cli("notes", "set", String(b), "superseded")).json.error).toContain("names its replacement");
+  expect((await cli("notes", "set", String(b), "superseded", "--by", String(a))).json).toMatchObject({ status: "superseded", supersededBy: a });
+  const set = (await cli("notes", "set", `1-${total}`, "verified", "--video", old)).json;
+  expect(set.every((n: any) => n.status === "verified")).toBe(true);
+  expect((await cli("notes", "set", "1-2", "done", "--shows", "x")).json.error).toContain("applies to one note");
+  const report = (await cli("notes", "report")).json.markdown as string;
+  expect(report).toContain(`superseded by #${a}`);
+
+  // Only the note done in the second draft is judged; the ones verified in an older draft are left out, not flagged.
+  const diff = (await cli("diff", old, fresh)).json;
+  expect(diff.notesWithoutDifference).toEqual([]);
+  expect(diff.notesDoneElsewhere).toBe(total);
+  expect(diff.ranges.find((r: any) => r.shots.includes("bounce")).notes).toEqual([a]);
+}, 180000);
 
 test("check: known exceptions pass, new problems fail, probes measure boxes", async () => {
   const ok = await cli("check");

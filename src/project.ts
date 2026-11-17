@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import { readHook, withSession } from "./browser";
+import { snapshotSources, sourceFiles } from "./sources";
 import type { Config, Cue, ShotDef } from "./config";
 import { CliError, round3 } from "./time";
 
@@ -98,30 +99,6 @@ export function loadLines(file: string | undefined): Line[] {
 
 const SOURCE_TEXT = /\.(ts|tsx|js|jsx|mjs|json|html|vue|svelte)$/;
 
-/** Every file matched by the config's `sources` globs. */
-export function sourceFiles(cfg: Config): string[] {
-  return cfg.sources.flatMap((g) => [...new Bun.Glob(g).scanSync({ cwd: cfg.root, onlyFiles: true })].map((f) => resolve(cfg.root, f)));
-}
-
-/** Every source file (and the config) with its modification time and size: what the picture was made from. */
-export function snapshotSources(cfg: Config): Map<string, string> {
-  const of = (file: string) => {
-    const st = statSync(file);
-    return `${st.mtimeMs}:${st.size}`;
-  };
-  return new Map([cfg.file, ...sourceFiles(cfg).sort()].map((file) => [relative(cfg.root, file), of(file)]));
-}
-
-/** The first file that was added, removed or modified between two snapshots, or null when they are the same. */
-export function changedSource(before: Map<string, string>, after: Map<string, string>): string | null {
-  for (const [file, state] of after) if (before.get(file) !== state) return file;
-  for (const file of before.keys()) if (!after.has(file)) return file;
-  return null;
-}
-
-/** The newest modification time among the source files and the config. */
-export const lastSourceChange = (cfg: Config) => Math.max(...[cfg.file, ...sourceFiles(cfg)].map((f) => statSync(f).mtimeMs));
-
 interface Facts {
   duration: number;
   shots: ShotDef[];
@@ -131,7 +108,7 @@ interface Facts {
 async function loadFacts(cfg: Config): Promise<Facts> {
   if (cfg.shots && cfg.duration !== undefined) return { shots: cfg.shots, duration: cfg.duration };
   if (!cfg.shots && !cfg.page.shots) throw new CliError(`the config needs "shots" (a list) or "page.shots" (the name of a window hook)`);
-  const cacheFile = resolve(cfg.root, ".beatclip", "page.json");
+  const cacheFile = resolve(cfg.root, ".beatclip", cfg.profile ? `page-${cfg.profile}.json` : "page.json");
   const sources = JSON.stringify([...snapshotSources(cfg)]);
   if (cfg.sources.length && existsSync(cacheFile)) {
     const c = JSON.parse(readFileSync(cacheFile, "utf8"));

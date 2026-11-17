@@ -29,7 +29,7 @@ Then, in your video project:
 beatclip doctor
 ```
 
-`doctor` checks the machine (Bun, ffmpeg, Chrome) and the project (config, audio, lyrics, beat grid, the page and its hooks) and says how to fix what is missing. `beatclip init` writes a starter config, and `beatclip docs` prints this manual.
+`doctor` checks the machine (Bun, ffmpeg, Chrome) and the project (config, audio, lyrics, beat grid, the page and its hooks; with a profile above scale 1 also canvases that would come out soft) and says how to fix what is missing. `beatclip init` writes a starter config, and `beatclip docs` prints this manual.
 
 Run `beatclip` from the project folder (it looks for `beatclip.config.json` there and in the parent folders), or pass `--project <folder>`, or set `BEATCLIP_PROJECT`.
 
@@ -63,6 +63,8 @@ All examples below are real output from the demo.
 The names can be changed in the config. [demo/index.html](demo/index.html) is a minimal page with all four.
 
 For `check`, each lyric word needs an element that a CSS selector can find from the line id and the word index (the demo uses `class="lw" data-word="a2:1"`). For `probe`, mark an element with `data-probe="<name>"`.
+
+For renders above scale 1 (4K from a 1920×1080 page): the page is shot with a higher device pixel ratio, so DOM, text and SVG come out sharp by themselves, but a `<canvas>` whose bitmap has the size of its box is only stretched. Multiply the bitmap size by `devicePixelRatio`. `beatclip doctor --profile <name>` lists such canvases.
 
 ## The config file
 
@@ -113,10 +115,11 @@ For `check`, each lyric word needs an element that a CSS selector can find from 
 | `sources` | Globs of the files the picture depends on. Used three ways: the shot list read from the page is cached until one of them changes, a render waits until they have been quiet for `render.settleMs`, and a render starts over when one changes while it is shooting. Shot ids are also searched in these files to report where a shot is defined. |
 | `cues` | Named moments: `[{ "name": "bar full", "t": 8.5 }]`. |
 | `beats` | `{ "first": 0.5, "interval": 0.5 }` for a constant tempo, or `{ "file": "beats.json" }` for measured beat times. `perBar` adds bar numbers. |
-| `out` | `dir` (default `out`), and inside it by default: `sheets` (`sheets`), `cache` (`cache/frames`), `proofs` (`proofs`), `video` (`video-{n}.mp4`; `{n}` becomes the first free number). |
+| `out` | `dir` (default `out`), and inside it by default: `sheets` (`sheets`), `cache` (`cache/frames`), `segments` (`cache/segments`), `proofs` (`proofs`), `video` (`video-{n}.mp4`; `{n}` becomes the first free number). |
 | `notes` | The ledger file, default `beatclip.notes.json`. |
 | `differs` | From which difference two frames count as different, default 10 (see [How frames are compared](#how-frames-are-compared)). |
-| `render` | `workers` (8), `quality` (JPEG, 93), `scale` (device scale factor, 1), `crf` (17), `preset` (`medium`), `settleMs` (1500), `samples` (frames re-shot to check the cache, 40), `differs` (difference from which a re-shot frame no longer matches the cache, 8). |
+| `render` | `workers` (8, or 4 when `scale` is above 1), `quality` (JPEG, 93), `scale` (device scale factor, 1), `crf` (17), `preset` (`medium`), `audioBitrate` (`256k`), `segment` (seconds per encoded segment, 4; 0 encodes in one pass), `settleMs` (1500), `samples` (frames re-shot to check the cache, 40), `changedSamples` (frames per shot compared by `render --changed`, 6), `differs` (difference from which a re-shot frame no longer matches the cache, 8). |
+| `profiles` | Named sets of overrides, chosen with `--profile <name>` (or `BEATCLIP_PROFILE`): `"profiles": { "4k": { "render": { "scale": 2 } } }`. A profile's keys replace the base ones, and it gets its own frame cache, segments and video names (`frames-4k`, `video-4k-{n}.mp4`) unless it sets them, so switching profiles never invalidates the other cache. |
 | `check` | `selector` of a word's element with `{line}` and `{word}` placeholders, `before` (0.15 s), `after` (0.02 s), `visible` (0.85), `hidden` (0.5), `frame` (`left`, `top`, `right`, `bottom` of the area words must stay inside), `shouts` (also check chanted letters, false), `allow` (the allowlist file), `probes` (rules, see `check`). |
 | `python` | Python with librosa, only for `analyze beats`. |
 
@@ -124,7 +127,7 @@ For `check`, each lyric word needs an element that a CSS selector can find from 
 
 Everywhere a time is expected you can write `1:07`, `1:07.5` or `67.5`. A lyric word is named `<line id>.<index from 0>`, for example `a2.1`. Beats are numbered from 0; `7.5` is the half beat after beat 7.
 
-Every command prints a readable answer by default and JSON with `--json`. Errors go to stderr with exit code 1 (and `{"error": ...}` on stdout with `--json`); an unexpected crash exits with 2. An option a command does not have, a leftover argument, or a one-value option given twice is an error, so a typo cannot silently turn into a different run. Progress of long commands goes to stderr.
+Every command takes `--project <folder>` and `--profile <name>`, prints a readable answer by default and JSON with `--json`. Errors go to stderr with exit code 1 (and `{"error": ...}` on stdout with `--json`); an unexpected crash exits with 2. An option a command does not have, a leftover argument, or a one-value option given twice is an error, so a typo cannot silently turn into a different run. Progress of long commands goes to stderr.
 
 ## Commands
 
@@ -198,7 +201,12 @@ out/sheets/20261117-115333-shot-bounce-beats-demo-2-vs-demo-1.png
 6 frames from demo-2.mp4 beside demo-1.mp4: 0:03.00 to 0:05.50; 6 of 6 differ (diff >= 10)
 ```
 
-Times are snapped to video frames. With `--compare` the two pictures of a time stand side by side and each label ends with their difference, marked `≠` when it reaches `differs`. Options: `--cols`, `--rows` (per sheet, default 6; more tiles make more sheets), `--width` (tile width, default 480), `--out <file.png>`.
+Times are snapped to video frames. With `--compare` the two pictures of a time stand side by side and each label ends with their difference, marked `≠` when it reaches `differs`.
+
+- `--crop x,y,w,h` (in page pixels) shows only that rectangle of every frame, from the page and from videos alike, for checking one small element. `beatclip probe` tells you where an element is.
+- A sheet is never wider than 2000 px (`--max-width`), so it stays readable when it is viewed scaled down: if `--cols` and `--width` ask for more, it uses fewer columns, then narrower pictures, and says so.
+- Other options: `--cols`, `--rows` (per sheet, default 6; more tiles make more sheets), `--width` (picture width, default 480), `--out <file.png>`.
+- Right after a source edit the dev server is still reloading the page: `frames` (like every command that opens the page) waits until the sources have been quiet for `render.settleMs` and starts over if the page reloads under it.
 
 Sheets are written to `out/sheets/<timestamp>-<what>.png`, a new name every time. If any capture fails the command exits with an error and writes nothing, and an existing file is never overwritten:
 
@@ -211,23 +219,28 @@ beatclip: no such video: /path/to/project/out/missing.mp4
 
 Screenshots the page frame by frame into a persistent frame cache (`out/cache/frames`, one JPEG per frame) and encodes the video from the cache with ffmpeg.
 
+The video is encoded in segments of `render.segment` seconds (default 4) that are kept in `out/cache/segments` and joined, with the audio, without re-encoding. A segment is encoded again only when one of its frames changed, so after a small fix the encode takes seconds instead of the time of the whole video. Every segment starts on a key frame and uses the same settings, which makes the join exact; `--whole` encodes in one pass instead. The frames are full-range JPEG, so they are converted to limited-range BT.709 and the file is tagged as such (`yuv420p`, `tv`, `bt709`), which is what players expect.
+
 ```bash
 beatclip render                         # full render
 beatclip render --from 1:05 --to 1:09   # re-shoot a range, encode the whole video from the cache
 beatclip render --shot bounce           # the range of a shot (repeatable, as is --from/--to)
 beatclip render --note 1                # the range of a note from the ledger
 beatclip render --notes                 # the ranges of all open and done notes
+beatclip render --changed               # find what changed by itself (see below)
 beatclip render --shot bounce --excerpt # encode only that stretch: a quick look
+beatclip render --full --profile 4k     # another scale, in its own cache
 ```
 
 ```
 $ beatclip render
+render: the frame cache will take about 0.0 GB (360 frames of 8 KB), 0.0 GB of it is there already; 76.5 GB free
 out/demo-1.mp4
 full render: 360 frames
-screenshots  2.2 s  (360 frames, 163.6 frames/s, 4 workers)
+screenshots  2.1 s  (360 frames, 171.4 frames/s, 4 workers)
 check        0.0 s  (not needed for a full render)
-encode       0.2 s  (360 frames from the cache)
-total        2.8 s
+encode       0.2 s  (3 of 3 segments encoded, all joined with the audio)
+total        3.2 s
 ```
 
 A partial render re-shoots only the asked ranges. To make sure nothing else changed, it then re-shoots a sample of frames outside them (the frames next to each range edge, the middle of every shot, and a spread over the rest) and compares them with the cache. If some no longer match, it says which times, widens the ranges by the whole shots those frames are in, and checks again; if that keeps failing or would cover most of the video, it shoots everything. Here the ball was recoloured, the note covered only the `bounce` shot, and the check found the ball in `finale` too:
@@ -238,10 +251,10 @@ check: 11 of 40 frames outside 0:03.00–0:06.00 no longer match the cache: 0:09
 check: widening to 0:03.00–0:06.00, 0:09.00–0:12.00
 out/demo-2.mp4
 partial render: 0:03.00–0:06.00, 0:09.00–0:12.00, 180 of 360 frames shot
-screenshots  2.3 s  (180 frames, 78.3 frames/s, 4 workers)
+screenshots  1.7 s  (180 frames, 105.9 frames/s, 4 workers)
 check        5.1 s  (11 frames outside the asked ranges differed from the cache; widened to 0:03.00–0:06.00, 0:09.00–0:12.00)
-encode       0.2 s  (360 frames from the cache)
-total        8.1 s
+encode       0.2 s  (3 of 3 segments encoded, all joined with the audio)
+total        7.4 s
 ```
 
 ```
@@ -249,9 +262,28 @@ $ beatclip render --shot bounce --excerpt
 out/excerpt-3.00-6.00-1.mp4
 partial render: 0:03.00–0:06.00, 90 of 360 frames shot
 screenshots  0.9 s  (90 frames, 100.0 frames/s, 4 workers)
-check        0.7 s  (40 frames outside the range re-shot, all match the cache)
-encode       0.1 s  (only the excerpt, 90 frames from the cache)
-total        2.2 s
+check        0.5 s  (40 frames outside the range re-shot, all match the cache)
+encode       0.1 s  (only the excerpt, 90 frames)
+total        1.9 s
+```
+
+`--changed` is for edits whose reach you do not know, such as a component used in many shots. It compares the first frame, the last frame and `render.changedSamples` frames in between (`--samples <n>`) of every shot with the cache, re-shoots every shot where one differs, and renders nothing when none does. A change that lasts only a few frames between two samples can be missed; raise `--samples` or name the range when that matters. Here the bar was recoloured, which touches two shots and two of the three segments:
+
+```
+$ beatclip render --changed
+scan: 2 shots differ from the cache: grow (8 frames, first at 0:06.00), finale (8 frames, first at 0:09.00)
+out/demo-3.mp4
+partial render: 0:06.00–0:12.00, 180 of 360 frames shot
+scan         6.3 s  (32 frames compared with the cache; changed shots: grow, finale)
+screenshots  1.3 s  (180 frames, 138.5 frames/s, 4 workers)
+check        0.6 s  (40 frames outside the range re-shot, all match the cache)
+encode       0.2 s  (2 of 3 segments encoded, all joined with the audio)
+total        8.7 s
+
+$ beatclip render --changed
+scan: no shot differs from the cache
+scan         0.6 s  (32 frames compared with the cache; changed shots: none)
+nothing differs from the cache; nothing was rendered or encoded
 ```
 
 Things it takes care of:
@@ -263,8 +295,9 @@ Things it takes care of:
 - **A page that is not quite a pure function of time.** A browser may paint the same time slightly differently after different earlier frames. A sampled frame that mismatches the cache is therefore re-shot arriving from other frames; if one of those reproduces the cached picture it is reported as unstable and nothing is widened.
 - **Output.** `{n}` in the video name is the first free number. A name without `{n}` that already exists is refused before anything is shot, so a draft is never overwritten. The file appears only when ffmpeg succeeded.
 - **A video that got shorter.** A full render removes cached frames past the new end.
+- **A disk that is too small.** Before a full render it shoots eight frames, estimates the size of the cache, and stops when cache, segments and video would not fit with a gigabyte to spare (`--no-space-check` overrides). `--drop-cache` deletes the profile's frames and segments after the video is written, for a one-off delivery at a large scale.
 
-Other options: `--full`, `--out <file>` (not with `--excerpt` or `--no-encode`), `--no-encode` (update the cache only), `--no-verify` (skip the check), `--no-widen` (fail instead of widening). The time each part took is always printed.
+Other options: `--full`, `--out <file>` (not with `--excerpt` or `--no-encode`), `--no-encode` (update the cache only), `--whole` (encode in one pass), `--no-verify` (skip the check), `--no-widen` (fail instead of widening). The time each part took is always printed.
 
 ### `beatclip notes`
 
@@ -272,10 +305,15 @@ A ledger (`beatclip.notes.json`) tying each change note to its time, its status 
 
 ```bash
 beatclip notes add 0:04 "the ball should be orange"         # --to <time> makes it a range
-beatclip notes list                                         # --status open|done|verified|rejected
-beatclip notes proof 1 before --video out/demo-1.mp4        # a frame at the note's time; without --video from the live page; --at <time>
-beatclip notes proof 1 after --video out/demo-2.mp4
+beatclip notes list                                         # --status open|done|verified|rejected|superseded
+beatclip notes proof 1 before --video out/demo-1.mp4        # a frame at the note's time; without --video from the live page
+beatclip notes proof 1 before --video out/demo-1.mp4 --at 3.75 --at 4 --at 4.25   # several moments of a movement
+beatclip notes proof all before --video out/demo-1.mp4      # a before frame for every note in one go
+beatclip notes proof 1 after --video out/demo-2.mp4         # also records demo-2.mp4 as the draft the note was done in
 beatclip notes set 1 done --shows "an orange ball on the floor line under the word ball"   # also --text, --to <time>, --to none
+beatclip notes set 1-10 verified                            # several notes: 3, 1,4, 2-6 or all
+beatclip notes set 3 done --video out/demo-2.mp4            # record the draft without taking a proof
+beatclip notes set 11 superseded --by 12                    # note 11 was replaced by note 12
 beatclip notes remove 2
 beatclip notes report                                       # --out report.md
 ```
@@ -284,23 +322,24 @@ beatclip notes report                                       # --out report.md
 $ beatclip notes add 0:04 "the ball should be orange"
 note #1 at 0:04.00: shot bounce, word a2.1 "ball"
 
-$ beatclip notes proof 1 after --video out/demo-2.mp4
-out/proofs/note-1-after-20261117-115331.jpg
-note #1 after proof at 0:04.00 from out/demo-2.mp4
-before and after: diff 95.0
+$ beatclip notes proof 1 after --video out/demo-3.mp4 --at 3.75 --at 4
+out/proofs/note-1-after-20261117-141153-1.jpg
+out/proofs/note-1-after-20261117-141153-2.jpg
+note #1 after proof at 0:03.75, 0:04.00 from out/demo-3.mp4; before and after: diff 95.0
 
 $ beatclip notes report
-2 notes: 0 open, 2 done, 0 verified, 0 rejected
+1 notes: 0 open, 1 done, 0 verified, 0 rejected, 0 superseded
 
 | # | Change | Time in the video | Shot | Status | What the frame shows | Proof |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | the ball should be orange | 0:04.00 | bounce | done | an orange ball on the floor line under the word ball | [before](out/proofs/note-1-before-20261117-115320.jpg) · [after](out/proofs/note-1-after-20261117-115331.jpg) (diff 95.0) |
-| 2 | the bar should grow faster | 0:07.00–0:08.50 | grow | done |  |  |
+| 1 | the ball should be orange | 0:04.00 | bounce | done in demo-3.mp4 | an orange ball on the floor line under the word ball | before [0:03.75](out/proofs/note-1-before-20261117-141129-1.jpg) [0:04.00](out/proofs/note-1-before-20261117-141129-2.jpg) · after [0:03.75](out/proofs/note-1-after-20261117-141153-1.jpg) [0:04.00](out/proofs/note-1-after-20261117-141153-2.jpg) (diff 95.0) |
 ```
 
 When the before and after proofs of a note look the same, `proof` says so and the report marks the row `LOOKS UNCHANGED`: the change was made in the code but does not read in the frame.
 
 A note without `--to` stands for the whole shot around its time when it drives `render --note` / `render --notes`.
+
+Statuses: `open`, `done`, `verified` (the user confirmed it), `rejected` (deliberately not done) and `superseded` (replaced by the note given with `--by`). A note remembers the draft it was done in: the video its after proof came from, or the one given to `notes set --video`.
 
 ### `beatclip diff <a.mp4> <b.mp4>`
 
@@ -312,11 +351,11 @@ $ beatclip diff out/demo-1.mp4 out/demo-2.mp4
   0:03.00–0:06.00       3.00 s   peak diff  96.0 at 0:03.23   bounce       notes #1
   0:09.00–0:12.00       3.00 s   peak diff  96.0 at 0:09.00   finale       NO NOTE
 1 of 2 ranges have no note
-note #2 (done) at 0:07.00 "the bar should grow faster": NO DIFFERENCE between the two drafts in its range
+note #2 (done, no draft recorded for it) at 0:07.00 "the bar should grow faster": NO DIFFERENCE between the two drafts in its range
 look at one:  beatclip frames --from 3 --to 6 --video out/demo-1.mp4 --compare out/demo-2.mp4
 ```
 
-A note accounts for a range anywhere in its shot (or its own range). Options: `--threshold` (default `differs`), `--gap` (seconds across which differing frames are joined into one range, default 0.5).
+A note accounts for a range anywhere in its shot (or its own range). Notes done in another draft than the second file are left out (they rightly did not change again), as are rejected and superseded ones; a done note with no draft recorded is still judged and marked as such, a verified one is not. Options: `--threshold` (default `differs`), `--gap` (seconds across which differing frames are joined into one range, default 0.5).
 
 ### `beatclip check`
 
@@ -357,7 +396,7 @@ $ beatclip probe ball --from 3 --to 6 --lowest
 
 ## How frames are compared
 
-Everywhere two pictures are compared (`frames --compare`, note proofs, `diff`, the cache check of `render`) the number is the same: both pictures are scaled to 480 pixels wide and subtracted, the result is averaged over 8×8 blocks, and the largest block average is the difference, from 0 (identical) to 255. Unlike a whole-frame score such as SSIM it stays high when only one small element changed, and it stays low for compression noise. As a guide: two encodes of the same frames stay below about 4, a live page against its encoded frame below about 8, and a real change of an element is usually above 20. `differs` (default 10) is the line between "same" and "different".
+Everywhere two pictures are compared (`frames --compare`, note proofs, `diff`, the cache check of `render`) the number is the same: both pictures are scaled to 480 pixels wide (a smaller crop is compared at its own size) and subtracted, the result is averaged over 8×8 blocks, and the largest block average is the difference, from 0 (identical) to 255. Unlike a whole-frame score such as SSIM it stays high when only one small element changed, and it stays low for compression noise. As a guide: two encodes of the same frames stay below about 4, a live page against its encoded frame below about 8, and a real change of an element is usually above 20. `differs` (default 10) is the line between "same" and "different".
 
 ## A round of changes
 
@@ -367,7 +406,7 @@ beatclip at 1:07                                             # where is that: sh
 beatclip notes proof 1 before --video out/draft-3.mp4        # the frame before the change
 # ... edit the scene ...
 beatclip frames --shot bounce --compare out/draft-3.mp4      # does the change read? live page beside the last draft
-beatclip render --notes                                      # re-shoot only what the notes cover
+beatclip render --notes                                      # re-shoot only what the notes cover (or: render --changed)
 beatclip notes proof 1 after --video out/draft-4.mp4
 beatclip notes set 1 done --shows "the ball touches the floor line on beat 134"
 beatclip diff out/draft-3.mp4 out/draft-4.mp4                # anything changed that no note covers?

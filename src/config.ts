@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { CliError } from "./time";
 
 export const CONFIG_NAME = "beatclip.config.json";
@@ -21,6 +21,8 @@ export interface Config {
   /** Project root: the folder of the config file. Every relative path is resolved against it. */
   root: string;
   file: string;
+  /** The profile in use (--profile), if any. */
+  profile?: string;
   page: {
     url: string;
     width: number;
@@ -45,11 +47,26 @@ export interface Config {
   sources: string[];
   cues: Cue[];
   beats: BeatsConfig;
-  out: { sheets: string; cache: string; video: string; proofs: string };
+  out: { sheets: string; cache: string; segments: string; video: string; proofs: string };
   notes: string;
   /** Two frames count as different when their difference (0..255, see ffmpeg.ts) reaches this. */
   differs: number;
-  render: { workers: number; quality: number; scale: number; crf: number; preset: string; settleMs: number; samples: number; differs: number };
+  render: {
+    workers: number;
+    quality: number;
+    scale: number;
+    crf: number;
+    preset: string;
+    audioBitrate: string;
+    /** Length in seconds of the pieces the video is encoded in, so a small change re-encodes little; 0 encodes in one pass. */
+    segment: number;
+    settleMs: number;
+    /** Frames outside a partial render re-shot to check the cache. */
+    samples: number;
+    /** Frames per shot (besides its first and last) that `render --changed` compares with the cache. */
+    changedSamples: number;
+    differs: number;
+  };
   check: {
     /** CSS selector of a word's element; {line} and {word} are replaced. */
     selector: string;
@@ -95,13 +112,28 @@ export function findConfig(explicit: string | undefined, cwd: string): string {
   }
 }
 
-export function loadConfig(file: string): Config {
+/** `over` laid on top of `base`: objects merge key by key, everything else (lists included) is replaced. */
+function merged(base: any, over: any): any {
+  if (!over || typeof over !== "object" || Array.isArray(over) || !base || typeof base !== "object" || Array.isArray(base)) return over;
+  const out = { ...base };
+  for (const [k, v] of Object.entries(over)) out[k] = k in base ? merged(base[k], v) : v;
+  return out;
+}
+
+/**
+ * Reads the config. With a profile (a named set of overrides under "profiles", for example a 4K delivery) the
+ * profile's keys replace the base ones, and its frame cache, segments and videos get their own names unless it sets them.
+ */
+export function loadConfig(file: string, profile?: string): Config {
   let raw: any;
   try {
     raw = JSON.parse(readFileSync(file, "utf8"));
   } catch (e) {
     throw new CliError(`cannot read ${file}: ${(e as Error).message}`);
   }
+  const over = profile ? raw.profiles?.[profile] : undefined;
+  if (profile && !over) throw new CliError(`no profile "${profile}" in ${file} (profiles: ${Object.keys(raw.profiles ?? {}).join(", ") || "none"})`);
+  if (over) raw = merged(raw, over);
   const root = dirname(file);
   const path = (p: string) => (isAbsolute(p) ? p : resolve(root, p));
   const opt = (p?: string) => (p ? path(p) : undefined);
@@ -109,11 +141,19 @@ export function loadConfig(file: string): Config {
   if (!raw.beats || !("file" in raw.beats || ("first" in raw.beats && "interval" in raw.beats)))
     throw new CliError(`${file}: "beats" needs {first, interval} or {file}`);
   const outDir = path(raw.out?.dir ?? "out");
-  const inOut = (p: string | undefined, dflt: string) => (p ? path(p) : resolve(outDir, dflt));
+  // A profile keeps its frames, segments and videos apart from the base ones: "frames-4k", "video-4k-{n}.mp4".
+  const own = (name: string, key: string) => (profile && over?.out?.[key] === undefined ? name.replace(/(-\{n\})?(\.\w+)?$/, `-${profile}$1$2`) : name);
+  const inOut = (key: string, dflt: string) => own(raw.out?.[key] ? path(raw.out[key]) : resolve(outDir, dflt), key);
+  const cache = inOut("cache", "cache/frames");
+  const ownSegments = profile ? over?.out?.segments : raw.out?.segments;
+  const beside = basename(cache).startsWith("frames") ? basename(cache).replace("frames", "segments") : `${basename(cache)}-segments`;
+  const segments = ownSegments ? path(ownSegments) : resolve(dirname(cache), beside);
+  const scale = raw.render?.scale ?? 1;
   const frame = { left: 0, top: 0, right: raw.page.width ?? 1920, bottom: raw.page.height ?? 1080, ...raw.check?.frame };
   return {
     root,
     file,
+    profile,
     page: {
       url: raw.page.url,
       width: raw.page.width ?? 1920,
@@ -134,14 +174,16 @@ export function loadConfig(file: string): Config {
     cues: raw.cues ?? [],
     beats: "file" in raw.beats ? { ...raw.beats, file: path(raw.beats.file) } : raw.beats,
     out: {
-      sheets: inOut(raw.out?.sheets, "sheets"),
-      cache: inOut(raw.out?.cache, "cache/frames"),
-      video: inOut(raw.out?.video, "video-{n}.mp4"),
-      proofs: inOut(raw.out?.proofs, "proofs"),
+      sheets: raw.out?.sheets ? path(raw.out.sheets) : resolve(outDir, "sheets"),
+      cache,
+      segments,
+      video: inOut("video", "video-{n}.mp4"),
+      proofs: raw.out?.proofs ? path(raw.out.proofs) : resolve(outDir, "proofs"),
     },
     notes: path(raw.notes ?? "beatclip.notes.json"),
     differs: raw.differs ?? 10,
-    render: { workers: 8, quality: 93, scale: 1, crf: 17, preset: "medium", settleMs: 1500, samples: 40, differs: 8, ...raw.render },
+    // Pages shot at a higher scale take several times the memory each, so fewer of them run at once by default.
+    render: { workers: scale > 1 ? 4 : 8, quality: 93, scale, crf: 17, preset: "medium", audioBitrate: "256k", segment: 4, settleMs: 1500, samples: 40, changedSamples: 6, differs: 8, ...raw.render },
     check: {
       selector: raw.check?.selector ?? '[data-word="{line}:{word}"]',
       shouts: raw.check?.shouts ?? false,

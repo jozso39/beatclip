@@ -5,7 +5,13 @@ import { fitGrid } from "../src/commands/analyze";
 import { differingRanges } from "../src/commands/diff";
 import { extremes } from "../src/commands/check";
 import { beat, find } from "../src/commands/lookup";
-import { inRanges, mergeRanges, pickSamples } from "../src/commands/render";
+import { fitSheet } from "../src/commands/frames";
+import { notesByIds, type Note } from "../src/commands/notes";
+import { inRanges, mergeRanges, pickSamples, shotSamples, spaceNeeded } from "../src/commands/render";
+import { isReload } from "../src/browser";
+import { loadConfig } from "../src/config";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import type { Config } from "../src/config";
 import { constantGrid, describe, listGrid, loadLines, nearestBeat, type Project } from "../src/project";
 import { fmtTime, parseTime } from "../src/time";
@@ -152,5 +158,73 @@ group("ranges", () => {
     const series = [50, 80, 100, 100, 70, 40, 60, 90, 60].map((y, i) => ({ t: i / 10, box: box(y) }));
     expect(extremes(series, "lowest")).toEqual([{ t: 0.25, y: 100 }, { t: 0.7, y: 90 }]);
     expect(extremes(series, "highest")).toEqual([{ t: 0.5, y: 30 }]);
+  });
+});
+
+group("render planning", () => {
+  test("--changed samples the first and last frame of every shot and some between", () => {
+    const picks = shotSamples(demoProject(), 2);
+    expect(picks).toEqual([0, 30, 59, 89, 90, 120, 149, 179, 180, 210, 239, 269, 270, 300, 329, 359]);
+  });
+  test("space a full render needs: missing frames, a third for the video, a gigabyte spare", () => {
+    expect(spaceNeeded(4e9, 0)).toBe(4e9 + 1.2e9 + 1e9);
+    expect(spaceNeeded(4e9, 4e9)).toBe(1.2e9 + 1e9);
+  });
+  test("a reload is told apart from a server that is gone", () => {
+    expect(isReload(new Error("page.evaluate: Execution context was destroyed, most likely because of a navigation"))).toBe(true);
+    expect(isReload(new Error("page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:1/\n - navigating to ..."))).toBe(false);
+    expect(isReload(new Error("ffmpeg failed"))).toBe(false);
+  });
+});
+
+group("sheets", () => {
+  test("a sheet wider than the limit loses columns first, then picture width", () => {
+    expect(fitSheet(4, 480, 1, 2000)).toEqual({ cols: 4, width: 480, changed: null });
+    expect(fitSheet(4, 620, 2, 2000)).toMatchObject({ cols: 1, width: 620 });
+    expect(fitSheet(4, 620, 2, 2600)).toMatchObject({ cols: 2, width: 620 });
+    expect(fitSheet(2, 1200, 2, 2000)).toMatchObject({ cols: 1, width: 991 });
+    expect(fitSheet(4, 620, 2, 2000).changed).toContain("1 column of 620 px");
+  });
+});
+
+group("notes", () => {
+  const notes = [1, 2, 3, 4, 5].map((id) => ({ id }) as Note);
+  test("ids as single numbers, lists, ranges and all", () => {
+    const ids = (spec: string) => notesByIds(notes, spec).map((n) => n.id);
+    expect(ids("3")).toEqual([3]);
+    expect(ids("1,4")).toEqual([1, 4]);
+    expect(ids("2-4,1,2")).toEqual([2, 3, 4, 1]);
+    expect(ids("all")).toEqual([1, 2, 3, 4, 5]);
+    for (const bad of ["x", "4-2", "9", "1-9"]) expect(() => notesByIds(notes, bad)).toThrow();
+  });
+});
+
+group("config profiles", () => {
+  const dir = mkdtempSync(`${tmpdir()}/beatclip-config-`);
+  const file = `${dir}/beatclip.config.json`;
+  writeFileSync(file, JSON.stringify({
+    page: { url: "http://localhost:1/", width: 640, height: 360 },
+    beats: { first: 0, interval: 0.5 },
+    out: { video: "out/draft-{n}.mp4" },
+    render: { quality: 90 },
+    profiles: { big: { render: { scale: 2 } }, own: { render: { scale: 2, workers: 6 }, out: { cache: "big/frames", video: "big/final.mp4" } } },
+  }));
+  test("the base config", () => {
+    const c = loadConfig(file);
+    expect(c.render).toMatchObject({ scale: 1, workers: 8, quality: 90, segment: 4, audioBitrate: "256k" });
+    expect([c.out.cache, c.out.segments, c.out.video]).toEqual([`${dir}/out/cache/frames`, `${dir}/out/cache/segments`, `${dir}/out/draft-{n}.mp4`]);
+  });
+  test("a profile overrides keys and gets its own cache, segments and video name", () => {
+    const c = loadConfig(file, "big");
+    expect(c.render).toMatchObject({ scale: 2, workers: 4, quality: 90 });
+    expect([c.out.cache, c.out.segments, c.out.video]).toEqual([`${dir}/out/cache/frames-big`, `${dir}/out/cache/segments-big`, `${dir}/out/draft-big-{n}.mp4`]);
+  });
+  test("a profile that names its own folders keeps them", () => {
+    const c = loadConfig(file, "own");
+    expect(c.render.workers).toBe(6);
+    expect([c.out.cache, c.out.segments, c.out.video]).toEqual([`${dir}/big/frames`, `${dir}/big/segments`, `${dir}/big/final.mp4`]);
+  });
+  test("an unknown profile is an error naming the ones there are", () => {
+    expect(() => loadConfig(file, "nope")).toThrow("big, own");
   });
 });

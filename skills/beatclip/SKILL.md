@@ -67,6 +67,8 @@ Skip this when `beatclip doctor` already says `ready`.
    | `cues` | named moments `[{ "name", "t" }]` |
    | `beats` | `{ "first", "interval", "perBar" }` for a constant tempo, or `{ "file" }` from `beatclip analyze beats` |
    | `out.video` | name of renders; `{n}` becomes the first free number, e.g. `out/draft-{n}.mp4` |
+   | `render` | `scale` (1; 2 gives 4K from a 1920x1080 page), `workers`, `quality`, `crf`, `preset`, `audioBitrate`, `segment` (seconds per encoded segment, 4) |
+   | `profiles` | named overrides chosen with `--profile <name>`, each with its own frame cache: `"profiles": { "4k": { "render": { "scale": 2 } } }` |
    | `check.selector` | CSS selector of a lyric word's element with `{line}` and `{word}` placeholders |
    | `differs` | from which difference (0..255) two frames count as different (default 10) |
 
@@ -90,6 +92,10 @@ Skip this when `beatclip doctor` already says `ready`.
   difference at that time. `LOOKS UNCHANGED` or `NO DIFFERENCE` means the change does not read: not done.
 - **Do not edit source files while a render is running** unless you mean to: the render notices and
   shoots the affected ranges again, which costs time.
+- **Right after an edit** every command that opens the page waits until the dev server has settled and
+  retries if the page reloads under it. "waiting for the page to settle" is not an error.
+- **Do not know how far an edit reaches** (a shared component, a style, a helper)? Use
+  `beatclip render --changed`; do not guess ranges and do not fall back to `--full`.
 
 ## 4. The routine for a round of notes
 
@@ -100,17 +106,20 @@ beatclip notes add 1:07 "the ball should land on the beat"
 # 2. Find out what each note is about: shot, source file and line, lyric word, beat
 beatclip at 1:07
 
-# 3. Keep the frame as it is now, from the last draft
-beatclip notes proof 1 before --video out/draft-3.mp4
+# 3. Keep the frames as they are now, from the last draft: all notes at once,
+#    and several moments for a note about a movement
+beatclip notes proof all before --video out/draft-3.mp4
+beatclip notes proof 1 before --video out/draft-3.mp4 --at 1:06.75 --at 1:07 --at 1:07.25
 
 # 4. Edit the scene. Then check the change reads, live page beside the last draft
 beatclip frames --shot bounce --compare out/draft-3.mp4
 beatclip render --shot bounce --excerpt          # a few seconds: only that shot, as a clip with sound
 
-# 5. When all notes are in, render what they cover and encode the whole video
-beatclip render --notes
+# 5. When all notes are in, render what changed (it finds the shots itself) and get the new draft
+beatclip render --changed                        # or: render --notes, for exactly what the notes cover
 
-# 6. Prove each note on the new draft and say what the frame shows
+# 6. Prove each note on the new draft and say what the frame shows.
+#    The after proof also records the draft the note was done in.
 beatclip notes proof 1 after --video out/draft-4.mp4
 beatclip notes set 1 done --shows "the ball touches the floor line exactly on beat 134"
 
@@ -124,7 +133,9 @@ beatclip check
 beatclip notes report
 ```
 
-Statuses are `open`, `done`, `verified` (the user confirmed it) and `rejected` (deliberately not done).
+Statuses are `open`, `done`, `verified` (the user confirmed it), `rejected` (deliberately not done) and
+`superseded` (replaced by a newer note: `beatclip notes set 11 superseded --by 12`). After the user
+confirms a round: `beatclip notes set 1-10 verified`.
 
 ## 5. Commands
 
@@ -156,7 +167,10 @@ its time, shot and the lyric word being sung.
 | a rendered file | `--video out/draft-4.mp4` |
 | two side by side | add `--compare out/draft-3.mp4`; every label ends with `diff <n>`, marked `≠` when the two differ |
 
-Other options: `--cols`, `--rows` (per sheet), `--width` (tile width, default 480), `--out <file.png>`.
+To check one small element, add `--crop x,y,w,h` (page pixels; `beatclip probe` tells you where an
+element is). Sheets are kept within 2000 px (`--max-width`): asking for more columns or wider pictures
+than fit gives fewer columns and a line saying so. Other options: `--cols`, `--rows` (per sheet),
+`--width` (picture width, default 480), `--out <file.png>`.
 
 ### Render
 
@@ -166,14 +180,20 @@ Other options: `--cols`, `--rows` (per sheet), `--width` (tile width, default 48
 | `beatclip render --from 1:05 --to 1:09` | re-shoots that range, encodes the whole video from the cache (repeatable) |
 | `beatclip render --shot <id>` | the range of a shot (repeatable) |
 | `beatclip render --note <id>` / `--notes` | the range of one note / of all open and done notes |
+| `beatclip render --changed` | compares a few frames of every shot with the cache and re-shoots the shots that differ; renders nothing when none does (`--samples <n>` per shot, default 6) |
 | `... --excerpt` | encodes only the re-shot stretch as its own clip: the fast way to look at one shot |
 | `... --no-encode` | only updates the cache |
+| `... --profile 4k` | renders with that profile's settings into its own cache (add `--drop-cache` to delete its frames after a one-off delivery) |
 
 After a partial shoot it re-shoots sample frames outside the range and compares them with the cache. If
 they differ it names the times, widens by whole shots, and shoots everything if that is not enough: read
 those lines, they tell you the change reached further than you asked. It prints how long screenshots,
-check and encode took. Only one render per project can run at a time. Do not delete `out/cache/frames`:
-partial renders need it. `--full` forces a full render; `--no-verify` and `--no-widen` change the check.
+check and encode took. The video is encoded in four-second segments and only segments whose frames
+changed are encoded again, so a small fix is quick (`--whole` encodes in one pass). The file is
+limited-range BT.709 and tagged, as players expect. Only one render per project can run at a time. Do
+not delete `out/cache`: without the frames the next render is a full one. Before a full render the cache
+size is estimated and the render refuses to start if the disk is too small. `--full` forces a full
+render; `--no-verify` and `--no-widen` change the check.
 
 ### Notes ledger
 
@@ -181,8 +201,9 @@ partial renders need it. `--full` forces a full render; `--no-verify` and `--no-
 | --- | --- |
 | `beatclip notes add <time> "<text>" [--to <time>]` | adds a note, prints its id and where it lands |
 | `beatclip notes list [--status open]` | the ledger |
-| `beatclip notes proof <id> before\|after [--video <file>] [--at <time>]` | saves a frame at the note's time (live page without `--video`); with both sides present it prints their difference |
-| `beatclip notes set <id> [status] [--shows "<what the frame shows>"] [--text ..] [--to <time>\|none]` | updates a note |
+| `beatclip notes proof <ids> before\|after [--video <file>] [--at <time> ...]` | saves a frame at each note's time (live page without `--video`); `--at` may repeat for one note; with both sides present it prints their difference; an after proof from a video records that draft |
+| `beatclip notes set <ids> [status] [--video <draft>] [--by <id>]` | status for one or many notes (`3`, `1,4`, `2-6`, `all`); `--video` records the draft; `superseded` needs `--by` |
+| `beatclip notes set <id> [--shows "<what the frame shows>"] [--text ..] [--to <time>\|none]` | wording of one note |
 | `beatclip notes remove <id>` | deletes a note |
 | `beatclip notes report [--out report.md]` | the Markdown table of all notes |
 
@@ -190,6 +211,8 @@ partial renders need it. `--full` forces a full render; `--no-verify` and `--no-
 
 `beatclip diff <a.mp4> <b.mp4>` lists the time ranges where the drafts differ, each with its shots and
 the notes that account for it, or `NO NOTE`. It also names notes marked done where nothing differs.
+Notes done in an earlier draft are left out (it knows from the after proof or `notes set --video`), so
+record the draft with every note you finish.
 `--threshold` and `--gap` tune it. To look at a range, use the `frames --compare` line it prints.
 
 ### Checks
@@ -218,4 +241,7 @@ Probe rules go in the config under `check.probes`, for example
 | `frames outside ... no longer match the cache` | the change reaches beyond the range you asked for; the render widens by itself |
 | `paint differently depending on what was drawn before` | the page is not a pure function of time at those frames; mention it to the user, it is a defect of the scene |
 | `already exists; choose another --out` | renders never overwrite; use a name with `{n}` or omit `--out` |
+| `not enough disk space for a full render` | free space, or lower `render.scale`; the message says how much is needed |
+| a canvas looks soft in a `--profile` render above scale 1 | its bitmap is not multiplied by `devicePixelRatio`; `beatclip doctor --profile <name>` lists such canvases |
+| `kept the sheet within 2000 px` | the sheet was laid out with fewer columns; add `--crop` or fewer frames, or raise `--max-width` |
 | a `diff` value just under 10 where you expected a change | a small element moved slightly; look with `frames --compare`, lower `--threshold` if needed |

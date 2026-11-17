@@ -3,7 +3,7 @@ import { CliError, parseTime } from "./time";
 /** Flags that never take a value; everything else written as --name takes the next token. */
 const SWITCHES = new Set([
   "json", "help", "next", "prev", "half", "beats", "full", "no-verify", "no-encode", "no-widen",
-  "update-allow", "excerpt", "lowest", "highest", "all", "notes",
+  "update-allow", "excerpt", "lowest", "highest", "all", "notes", "changed", "whole", "drop-cache", "no-space-check",
 ]);
 
 export class Args {
@@ -52,11 +52,11 @@ export class Args {
 
   /**
    * Fails on an option the command does not have (a typo would otherwise silently change what runs)
-   * and on a single-valued option given twice. --json, --project and --help belong to every command.
+   * and on a single-valued option given twice. --json, --project, --profile and --help belong to every command.
    */
   allow(options: string[], repeatable: string[] = []) {
     for (const [name, values] of this.flags) {
-      if (!["json", "project", "help", ...options, ...repeatable].includes(name)) throw new CliError(`unknown option --${name} (this command takes: ${[...options, ...repeatable].map((o) => `--${o}`).join(" ") || "no options"})`);
+      if (!["json", "project", "profile", "help", ...options, ...repeatable].includes(name)) throw new CliError(`unknown option --${name} (this command takes: ${[...options, ...repeatable].map((o) => `--${o}`).join(" ") || "no options"})`);
       if (values.length > 1 && !repeatable.includes(name)) throw new CliError(`--${name} was given ${values.length} times; it takes one value`);
     }
   }

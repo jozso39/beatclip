@@ -49,8 +49,11 @@ export async function diff(p: Project, args: Args, cwd: string): Promise<Result>
   const diffs = await differences(a, b, ia.width / ia.height);
   const ranges = differingRanges(diffs, ia.fps, threshold, Math.round((args.num("gap") ?? 0.5) * ia.fps));
 
-  // Rejected notes changed nothing on purpose; every other note is expected to show up as a difference.
-  const notes = loadNotes(p.cfg).filter((n) => n.status !== "rejected");
+  // Which notes this comparison can say something about: not the ones given up (rejected, superseded),
+  // and not the ones whose change went into another draft than the second file.
+  const ledger = loadNotes(p.cfg).filter((n) => n.status !== "rejected" && n.status !== "superseded");
+  const notes = ledger.filter((n) => n.doneIn === undefined || resolve(p.cfg.root, n.doneIn) === b);
+  const elsewhere = ledger.length - notes.length;
   const explained = ranges.map((range) => ({
     ...range,
     shots: p.shots.filter((s) => overlaps([s.s, s.e], [range.from, range.to])).map((s) => s.id),
@@ -60,7 +63,10 @@ export async function diff(p: Project, args: Args, cwd: string): Promise<Result>
   const near = (n: Note): [number, number] => (n.to !== undefined ? [n.t, n.to] : [n.t - NEAR, n.t + NEAR]);
   // Only notes inside the compared stretch can be judged (the drafts may differ in length).
   const compared: [number, number] = [0, diffs.length / ia.fps];
-  const silent = notes.filter((n) => n.status !== "open" && overlaps(near(n), compared) && !ranges.some((range) => overlaps(near(n), [range.from, range.to])));
+  // Judged: notes done in the second file, and notes marked done with no draft on record. A verified note
+  // without a draft was confirmed by the user in some earlier draft and is not expected to change again.
+  const judged = (n: Note) => (n.doneIn !== undefined ? n.status !== "open" : n.status === "done");
+  const silent = notes.filter((n) => judged(n) && overlaps(near(n), compared) && !ranges.some((range) => overlaps(near(n), [range.from, range.to])));
   const lengthNote = ia.frames === ib.frames ? null : `${basename(a)} has ${ia.frames} frames, ${basename(b)} has ${ib.frames}; only the first ${diffs.length} could be compared`;
 
   const rows = explained.map((x) => {
@@ -73,12 +79,13 @@ export async function diff(p: Project, args: Args, cwd: string): Promise<Result>
     `${ranges.length} ranges differ between ${basename(a)} and ${basename(b)}  (${diffs.length} frames compared; a frame differs when diff >= ${threshold} of 255)`,
     ...rows,
     ...(notes.length ? [`${unexplained} of ${ranges.length} ranges have no note`] : ["no notes in the ledger to match the ranges against"]),
-    ...silent.map((n) => `note #${n.id} (${n.status}) at ${fmtTime(n.t)} "${n.text}": NO DIFFERENCE between the two drafts ${n.to !== undefined ? "in its range" : `within ${NEAR} s of it`}`),
+    ...silent.map((n) => `note #${n.id} (${n.status}${n.doneIn ? "" : ", no draft recorded for it"}) at ${fmtTime(n.t)} "${n.text}": NO DIFFERENCE between the two drafts ${n.to !== undefined ? "in its range" : `within ${NEAR} s of it`}`),
+    ...(elsewhere ? [`${elsewhere} notes were done in other drafts than ${basename(b)} and were left out`] : []),
     ...(lengthNote ? [lengthNote] : []),
     ...(longest ? [`look at one:  beatclip frames --from ${longest.from} --to ${longest.to} --video ${relative(cwd, a)} --compare ${relative(cwd, b)}`] : []),
   ].join("\n");
   return {
-    data: { a, b, frames: diffs.length, threshold, ranges: explained, unexplained, notesWithoutDifference: silent.map((n) => n.id), lengthNote },
+    data: { a, b, frames: diffs.length, threshold, ranges: explained, unexplained, notesWithoutDifference: silent.map((n) => n.id), notesDoneElsewhere: elsewhere, lengthNote },
     text,
   };
 }

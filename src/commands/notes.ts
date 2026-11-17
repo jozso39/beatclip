@@ -1,15 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
+import { basename, dirname, relative, resolve } from "node:path";
 import type { Args } from "../args";
 import { shootPicture, withSession } from "../browser";
 import type { Config } from "../config";
-import { difference, grabFrame, probeVideo } from "../ffmpeg";
-import { describe, shotAt, type Project } from "../project";
+import { difference, grabFrame, pool, probeVideo } from "../ffmpeg";
+import { describe, frameAt, shotAt, type Project } from "../project";
 import { uniquePath } from "../sheet";
 import { CliError, fmtSpan, fmtTime, parseTime, round3, stamp } from "../time";
 import type { Result } from "./lookup";
 
-export const STATUSES = ["open", "done", "verified", "rejected"] as const;
+export const STATUSES = ["open", "done", "verified", "rejected", "superseded"] as const;
 export type Status = (typeof STATUSES)[number];
 
 interface Proof {
@@ -30,17 +30,25 @@ export interface Note {
   status: Status;
   /** What the frame shows now, written when the change is checked. */
   shows?: string;
-  before?: Proof;
-  after?: Proof;
-  /** How different the before and after pictures are (0 = identical, 255 = most; below the config's `differs` they look the same). */
+  /** Frames from before and after the change; several when the note is about a movement. */
+  before?: Proof[];
+  after?: Proof[];
+  /** How different the before and after pictures are at most (0 = identical, 255 = most; below the config's `differs` they look the same). */
   diff?: number;
+  /** The draft the change was done in (the video its "after" proof came from), relative to the project root. */
+  doneIn?: string;
+  /** For a superseded note: the note that replaced it. */
+  supersededBy?: number;
   created: string;
   updated: string;
 }
 
 export function loadNotes(cfg: Config): Note[] {
   if (!existsSync(cfg.notes)) return [];
-  return JSON.parse(readFileSync(cfg.notes, "utf8")).notes;
+  const notes = JSON.parse(readFileSync(cfg.notes, "utf8")).notes as Note[];
+  // Ledgers written before a note could hold several proof frames have one frame per side, not a list.
+  for (const n of notes) for (const side of ["before", "after"] as const) if (n[side] && !Array.isArray(n[side])) n[side] = [n[side] as unknown as Proof];
+  return notes;
 }
 
 /** Writes the ledger through a temporary file, so an interrupted write cannot leave half a ledger. */
@@ -50,20 +58,35 @@ function saveNotes(cfg: Config, notes: Note[]) {
   renameSync(tmp, cfg.notes);
 }
 
-export function noteById(notes: Note[], id: string): Note {
+export function noteById(notes: Note[], id: string | number): Note {
   const note = notes.find((n) => n.id === Number(id));
   if (!note) throw new CliError(`no note ${id} (notes: ${notes.map((n) => n.id).join(", ") || "none yet"})`);
   return note;
 }
 
-/** Changes one note in the ledger as it is on disk right now (another command may have written it meanwhile) and saves it. */
-function updateNote(cfg: Config, id: string, change: (note: Note) => void): Note {
+/** The notes named by "3", "1,4", "2-6", a mix of those, or "all". */
+export function notesByIds(notes: Note[], spec: string): Note[] {
+  if (spec === "all") return notes;
+  const ids = spec.split(",").flatMap((part) => {
+    const m = part.match(/^(\d+)(?:-(\d+))?$/);
+    if (!m) throw new CliError(`"${spec}" does not name notes (write 3, 1,4, 2-6 or all)`);
+    const [a, b] = [Number(m[1]), Number(m[2] ?? m[1])];
+    if (b < a) throw new CliError(`the range ${part} runs backwards`);
+    return Array.from({ length: b - a + 1 }, (_, i) => a + i);
+  });
+  return [...new Set(ids)].map((id) => noteById(notes, id));
+}
+
+/** Changes notes in the ledger as it is on disk right now (another command may have written it meanwhile) and saves it. */
+function updateNotes(cfg: Config, ids: number[], change: (note: Note) => void): Note[] {
   const all = loadNotes(cfg);
-  const note = noteById(all, id);
-  change(note);
-  note.updated = new Date().toISOString();
+  const changed = ids.map((id) => noteById(all, id));
+  for (const note of changed) {
+    change(note);
+    note.updated = new Date().toISOString();
+  }
   saveNotes(cfg, all);
-  return note;
+  return changed;
 }
 
 function asStatus(s: string): Status {
@@ -78,24 +101,30 @@ export function noteRange(p: Project, note: Note): [number, number] {
   return shot ? [shot.s, shot.e] : [note.t, Math.min(p.duration, note.t + 1)];
 }
 
-/** Notes still waiting to be seen in a render: everything not verified or rejected. */
+/** Notes still waiting to be seen in a render: open ones and those done but not yet confirmed. */
 export const pendingNotes = (notes: Note[]) => notes.filter((n) => n.status === "open" || n.status === "done");
 
 const when = (n: Note) => (n.to !== undefined ? fmtSpan(n.t, n.to) : fmtTime(n.t));
 const cell = (s: string) => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
+const statusText = (n: Note) => `${n.status}${n.supersededBy ? ` by #${n.supersededBy}` : ""}${n.doneIn && n.status !== "superseded" ? ` in ${basename(n.doneIn)}` : ""}`;
 
 function listText(p: Project, notes: Note[]): string {
   if (!notes.length) return "no notes";
-  return notes.map((n) => `#${String(n.id).padEnd(3)} ${n.status.padEnd(8)} ${when(n).padEnd(17)} ${(shotAt(p, n.t)?.id ?? "–").padEnd(10)} ${n.text}${n.shows ? `\n     shows: ${n.shows}` : ""}`).join("\n");
+  return notes
+    .map((n) => {
+      const extra = [n.supersededBy ? `superseded by #${n.supersededBy}` : "", n.doneIn ? `in ${basename(n.doneIn)}` : ""].filter(Boolean).join(", ");
+      return `#${String(n.id).padEnd(3)} ${n.status.padEnd(10)} ${when(n).padEnd(17)} ${(shotAt(p, n.t)?.id ?? "–").padEnd(10)} ${n.text}${extra ? `  [${extra}]` : ""}${n.shows ? `\n     shows: ${n.shows}` : ""}`;
+    })
+    .join("\n");
 }
 
 /** The Markdown table: one row per note with its time in the video and what the frame shows. */
 export function reportMarkdown(p: Project, notes: Note[], linkBase: string): string {
-  const link = (label: string, proof?: Proof) => (proof ? `[${label}](${relative(linkBase, resolve(p.cfg.root, proof.file))})` : "");
+  const side = (label: string, proofs?: Proof[]) => (proofs?.length ? `${label} ${proofs.map((pr) => `[${fmtTime(pr.t)}](${relative(linkBase, resolve(p.cfg.root, pr.file))})`).join(" ")}` : "");
   const rows = notes.map((n) => {
-    const proof = [link("before", n.before), link("after", n.after)].filter(Boolean).join(" · ");
+    const proof = [side("before", n.before), side("after", n.after)].filter(Boolean).join(" · ");
     const alike = n.diff === undefined ? "" : n.diff < p.cfg.differs ? ` (LOOKS UNCHANGED: diff ${n.diff.toFixed(1)})` : ` (diff ${n.diff.toFixed(1)})`;
-    return `| ${n.id} | ${cell(n.text)} | ${when(n)} | ${shotAt(p, n.t)?.id ?? "–"} | ${n.status} | ${cell(n.shows ?? "")} | ${proof}${proof ? alike : ""} |`;
+    return `| ${n.id} | ${cell(n.text)} | ${when(n)} | ${shotAt(p, n.t)?.id ?? "–"} | ${statusText(n)} | ${cell(n.shows ?? "")} | ${proof}${proof ? alike : ""} |`;
   });
   const count = (s: Status) => notes.filter((n) => n.status === s).length;
   return [
@@ -107,14 +136,36 @@ export function reportMarkdown(p: Project, notes: Note[], linkBase: string): str
   ].join("\n");
 }
 
-/** Saves the frame at a note's time from the live page or a rendered file as that note's before/after proof. */
-async function takeProof(p: Project, note: Note, side: "before" | "after", video: string | undefined, t: number): Promise<Proof> {
-  mkdirSync(p.cfg.out.proofs, { recursive: true });
-  const file = uniquePath(p.cfg.out.proofs, `note-${note.id}-${side}-${stamp()}`, "jpg");
-  const width = Math.min(960, p.cfg.page.width);
-  if (video) await grabFrame(video, await probeVideo(video), t, width, file);
-  else await withSession(p.cfg, async (s) => shootPicture(await s.open(p.cfg.render.scale), p.cfg, t, width, file));
-  return { file: relative(p.cfg.root, file), source: video ? relative(p.cfg.root, video) : "live page", t };
+/** Saves one frame per (note, time) from the live page or a rendered file, and returns the proofs in the same order. */
+async function takeProofs(p: Project, jobs: { note: Note; t: number }[], side: "before" | "after", video: string | undefined): Promise<Proof[]> {
+  const cfg = p.cfg;
+  mkdirSync(cfg.out.proofs, { recursive: true });
+  const width = Math.min(960, cfg.page.width);
+  const source = video ? relative(cfg.root, video) : "live page";
+  const mark = stamp();
+  const files = jobs.map((j, i) => uniquePath(cfg.out.proofs, `note-${j.note.id}-${side}-${mark}-${i + 1}`, "jpg"));
+  if (video) {
+    const info = await probeVideo(video);
+    await pool(jobs, 6, (j, i) => grabFrame(video, info, j.t, width, files[i]));
+  } else
+    await withSession(cfg, async (s) => {
+      const page = await s.open(cfg.render.scale);
+      // The page is shot at the time of the video frame that shows this moment, so it can be compared with a frame of a draft.
+      for (const [i, j] of jobs.entries()) await shootPicture(page, cfg, frameAt(p, j.t) / p.fps, width, files[i]);
+    });
+  return jobs.map((j, i) => ({ file: relative(cfg.root, files[i]), source, t: j.t }));
+}
+
+/** The largest difference between the before and after frames that show the same moment (or stand at the same place). */
+async function proofDiff(cfg: Config, before: Proof[], after: Proof[]): Promise<number | undefined> {
+  const pairs = after.flatMap((a, i) => {
+    const b = before.find((x) => x.t === a.t) ?? (before.length === after.length ? before[i] : undefined);
+    return b ? [[b, a] as const] : [];
+  });
+  if (!pairs.length) return undefined;
+  const aspect = cfg.page.width / cfg.page.height;
+  const diffs = await pool(pairs, 6, ([b, a]) => difference(resolve(cfg.root, b.file), resolve(cfg.root, a.file), aspect));
+  return round3(Math.max(...diffs));
 }
 
 /** A note's end time from --to: after its start, inside the video; "none" removes it. */
@@ -126,85 +177,125 @@ function endTime(p: Project, args: Args, start: number): number | undefined {
   return to;
 }
 
-/** `notes add|list|set|proof|remove|report`: the ledger tying each note to its time, status and proof frames. */
-export async function notes(p: Project, args: Args, cwd: string): Promise<Result> {
+/** The draft named by --video, as an absolute path that exists. */
+function videoArg(args: Args, cwd: string): string | undefined {
+  if (!args.has("video")) return undefined;
+  const video = resolve(cwd, args.str("video")!);
+  if (!existsSync(video)) throw new CliError(`no such video: ${video}`);
+  return video;
+}
+
+function add(p: Project, args: Args): Result {
   const cfg = p.cfg;
-  const action = args.rest.shift() ?? "list";
-  const options: Record<string, string[]> = { add: ["to"], list: ["status"], set: ["shows", "text", "to"], proof: ["video", "at"], remove: [], report: ["out"] };
-  if (!options[action]) throw new CliError(`unknown notes action "${action}" (${Object.keys(options).join(", ")})`);
-  args.allow(options[action]);
-
-  if (action === "add") {
-    const t = parseTime(args.take("the note's time (beatclip notes add 1:07 \"the ball should land on the beat\")"));
-    if (t >= p.duration) throw new CliError(`${fmtTime(t)} is past the end of the video (${fmtTime(p.duration)})`);
-    const text = args.rest.join(" ").trim();
-    if (!text) throw new CliError("missing the note's text");
-    const to = args.has("to") ? endTime(p, args, t) : undefined;
-    const now = new Date().toISOString();
-    const all = loadNotes(cfg);
-    const note: Note = { id: Math.max(0, ...all.map((n) => n.id)) + 1, t, ...(to === undefined ? {} : { to }), text, status: "open", created: now, updated: now };
-    saveNotes(cfg, [...all, note]);
-    const m = describe(p, t);
-    return { data: { note, moment: m }, text: `note #${note.id} at ${when(note)}: shot ${m.shot?.id ?? "–"}${m.word ? `, word ${m.word.key} "${m.word.w}"` : ""}` };
-  }
-
-  if (action === "list") {
-    args.noMore();
-    const status = args.str("status");
-    const shown = loadNotes(cfg).filter((n) => !status || n.status === asStatus(status));
-    return { data: shown, text: listText(p, shown) };
-  }
-
-  if (action === "set") {
-    const id = args.take("a note id");
-    const status = args.rest.shift();
-    args.noMore();
-    const note = updateNote(cfg, id, (n) => {
-      if (status) n.status = asStatus(status);
-      if (args.has("shows")) n.shows = args.str("shows");
-      if (args.has("text")) n.text = args.str("text")!;
-      if (args.has("to")) {
-        const to = endTime(p, args, n.t);
-        if (to === undefined) delete n.to;
-        else n.to = to;
-      }
-    });
-    return { data: note, text: listText(p, [note]) };
-  }
-
-  if (action === "proof") {
-    const id = args.take("a note id");
-    const side = args.take("before or after");
-    args.noMore();
-    if (side !== "before" && side !== "after") throw new CliError(`proof is "before" or "after", not "${side}"`);
-    const video = args.str("video") && resolve(cwd, args.str("video")!);
-    const known = noteById(loadNotes(cfg), id);
-    const proof = await takeProof(p, known, side, video, args.time("at") ?? known.t);
-    const other = known[side === "before" ? "after" : "before"];
-    const diff = other && round3(await difference(resolve(cfg.root, proof.file), resolve(cfg.root, other.file), cfg.page.width / cfg.page.height));
-    // The capture took a while: apply the result to the ledger as it is now.
-    const note = updateNote(cfg, id, (n) => {
-      n[side] = proof;
-      if (diff !== undefined) n.diff = diff;
-    });
-    const alike = note.diff === undefined ? "" : `\nbefore and after: diff ${note.diff.toFixed(1)}${note.diff < cfg.differs ? "  (they look unchanged: the change does not read in the frame)" : ""}`;
-    return { data: note, text: `${resolve(cfg.root, proof.file)}\nnote #${note.id} ${side} proof at ${fmtTime(proof.t)} from ${proof.source}${alike}` };
-  }
-
-  if (action === "remove") {
-    const id = args.take("a note id");
-    args.noMore();
-    const all = loadNotes(cfg);
-    const note = noteById(all, id);
-    saveNotes(cfg, all.filter((n) => n !== note));
-    return { data: note, text: `removed note #${note.id}` };
-  }
-
-  // report
-  args.noMore();
+  const t = parseTime(args.take('the note\'s time (beatclip notes add 1:07 "the ball should land on the beat")'));
+  if (t >= p.duration) throw new CliError(`${fmtTime(t)} is past the end of the video (${fmtTime(p.duration)})`);
+  const text = args.rest.join(" ").trim();
+  if (!text) throw new CliError("missing the note's text");
+  const to = args.has("to") ? endTime(p, args, t) : undefined;
+  const now = new Date().toISOString();
   const all = loadNotes(cfg);
+  const note: Note = { id: Math.max(0, ...all.map((n) => n.id)) + 1, t, ...(to === undefined ? {} : { to }), text, status: "open", created: now, updated: now };
+  saveNotes(cfg, [...all, note]);
+  const m = describe(p, t);
+  return { data: { note, moment: m }, text: `note #${note.id} at ${when(note)}: shot ${m.shot?.id ?? "–"}${m.word ? `, word ${m.word.key} "${m.word.w}"` : ""}` };
+}
+
+/** `notes set <ids> [status]`: status and the draft it was done in for any number of notes; wording for one. */
+function set(p: Project, args: Args, cwd: string): Result {
+  const cfg = p.cfg;
+  const chosen = notesByIds(loadNotes(cfg), args.take("note ids (3, 1,4, 2-6 or all)"));
+  const status = args.rest.length ? asStatus(args.rest.shift()!) : undefined;
+  args.noMore();
+  const single = ["shows", "text", "to"].find((o) => args.has(o));
+  if (single && chosen.length > 1) throw new CliError(`--${single} applies to one note; ${chosen.length} were named`);
+  if (args.has("by") !== (status === "superseded")) throw new CliError("a superseded note names its replacement: notes set <id> superseded --by <id of the new note>");
+  const by = args.has("by") ? noteById(loadNotes(cfg), args.str("by")!).id : undefined;
+  if (by !== undefined && chosen.some((n) => n.id === by)) throw new CliError("a note cannot be superseded by itself");
+  const video = videoArg(args, cwd);
+  const changed = updateNotes(cfg, chosen.map((n) => n.id), (n) => {
+    if (status) n.status = status;
+    if (by !== undefined) n.supersededBy = by;
+    else if (status) delete n.supersededBy;
+    if (video) n.doneIn = relative(cfg.root, video);
+    if (args.has("shows")) n.shows = args.str("shows");
+    if (args.has("text")) n.text = args.str("text")!;
+    if (args.has("to")) {
+      const to = endTime(p, args, n.t);
+      if (to === undefined) delete n.to;
+      else n.to = to;
+    }
+  });
+  return { data: changed.length === 1 ? changed[0] : changed, text: listText(p, changed) };
+}
+
+/** `notes proof <ids> before|after`: frames at each note's time (or at every --at for one note). */
+async function proof(p: Project, args: Args, cwd: string): Promise<Result> {
+  const cfg = p.cfg;
+  const chosen = notesByIds(loadNotes(cfg), args.take("note ids (3, 1,4, 2-6 or all)"));
+  const side = args.take("before or after");
+  args.noMore();
+  if (side !== "before" && side !== "after") throw new CliError(`proof is "before" or "after", not "${side}"`);
+  if (!chosen.length) throw new CliError("there are no notes to take proofs for");
+  const at = args.all("at").map(parseTime);
+  if (at.length && chosen.length > 1) throw new CliError("--at gives the moments of one note; name one note with it");
+  const video = videoArg(args, cwd);
+  const jobs = chosen.flatMap((note) => (at.length ? at : [note.t]).map((t) => ({ note, t })));
+  const proofs = await takeProofs(p, jobs, side, video);
+  const of = (id: number) => proofs.filter((_, i) => jobs[i].note.id === id);
+  const diffs = new Map<number, number | undefined>();
+  for (const n of chosen) diffs.set(n.id, await proofDiff(cfg, side === "before" ? of(n.id) : (n.before ?? []), side === "after" ? of(n.id) : (n.after ?? [])));
+  // The captures took a while: apply the result to the ledger as it is now.
+  const changed = updateNotes(cfg, chosen.map((n) => n.id), (n) => {
+    n[side] = of(n.id);
+    const diff = diffs.get(n.id);
+    if (diff === undefined) delete n.diff;
+    else n.diff = diff;
+    if (side === "after" && video) n.doneIn = relative(cfg.root, video);
+  });
+  const lines = changed.flatMap((n) => {
+    const alike = n.diff === undefined ? "" : `; before and after: diff ${n.diff.toFixed(1)}${n.diff < cfg.differs ? "  (they look unchanged: the change does not read in the frame)" : ""}`;
+    return [...n[side]!.map((pr) => resolve(cfg.root, pr.file)), `note #${n.id} ${side} proof at ${n[side]!.map((pr) => fmtTime(pr.t)).join(", ")} from ${n[side]![0].source}${alike}`];
+  });
+  return { data: changed.length === 1 ? changed[0] : changed, text: lines.join("\n") };
+}
+
+function remove(p: Project, args: Args): Result {
+  const all = loadNotes(p.cfg);
+  const note = noteById(all, args.take("a note id"));
+  args.noMore();
+  saveNotes(p.cfg, all.filter((n) => n !== note));
+  return { data: note, text: `removed note #${note.id}` };
+}
+
+function report(p: Project, args: Args, cwd: string): Result {
+  args.noMore();
+  const all = loadNotes(p.cfg);
   const out = args.str("out") && resolve(cwd, args.str("out")!);
-  const md = reportMarkdown(p, all, out ? dirname(out) : cfg.root);
+  const md = reportMarkdown(p, all, out ? dirname(out) : p.cfg.root);
   if (out) writeFileSync(out, md + "\n");
   return { data: { file: out ?? null, notes: all, markdown: md }, text: out ? `${md}\n\nwrote ${out}` : md };
+}
+
+function list(p: Project, args: Args): Result {
+  args.noMore();
+  const status = args.str("status");
+  const shown = loadNotes(p.cfg).filter((n) => !status || n.status === asStatus(status));
+  return { data: shown, text: listText(p, shown) };
+}
+
+/** `notes add|list|set|proof|remove|report`: the ledger tying each note to its time, status, draft and proof frames. */
+export async function notes(p: Project, args: Args, cwd: string): Promise<Result> {
+  const action = args.rest.shift() ?? "list";
+  const actions: Record<string, { options: string[]; repeatable?: string[]; run: () => Result | Promise<Result> }> = {
+    add: { options: ["to"], run: () => add(p, args) },
+    list: { options: ["status"], run: () => list(p, args) },
+    set: { options: ["shows", "text", "to", "video", "by"], run: () => set(p, args, cwd) },
+    proof: { options: ["video"], repeatable: ["at"], run: () => proof(p, args, cwd) },
+    remove: { options: [], run: () => remove(p, args) },
+    report: { options: ["out"], run: () => report(p, args, cwd) },
+  };
+  const chosen = actions[action];
+  if (!chosen) throw new CliError(`unknown notes action "${action}" (${Object.keys(actions).join(", ")})`);
+  args.allow(chosen.options, chosen.repeatable);
+  return chosen.run();
 }

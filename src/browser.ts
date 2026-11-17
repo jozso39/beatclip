@@ -4,7 +4,8 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, 
 import { resolve } from "node:path";
 import type { Config } from "./config";
 import { atExit, identify, recordAlive, type ProcessId } from "./exit";
-import { scalePicture } from "./ffmpeg";
+import { scalePicture, type Crop } from "./ffmpeg";
+import { settle } from "./sources";
 import { CliError } from "./time";
 
 async function reachable(url: string): Promise<boolean> {
@@ -103,7 +104,8 @@ export async function openSession(cfg: Config): Promise<Session> {
       const page = await ctx.newPage();
       page.on("pageerror", (e) => console.error(`page error: ${e.message}`));
       await page.goto(cfg.page.url);
-      await page.waitForFunction((name) => (window as any)[name] === true, cfg.page.ready, { timeout: 60000 }).catch(() => {
+      await page.waitForFunction((name) => (window as any)[name] === true, cfg.page.ready, { timeout: 60000 }).catch((e) => {
+        if (isReload(e)) throw e;
         throw new CliError(`window.${cfg.page.ready} did not become true within 60 s at ${cfg.page.url}`);
       });
       return page;
@@ -115,13 +117,27 @@ export async function openSession(cfg: Config): Promise<Session> {
   };
 }
 
-/** Runs `fn` with a browser session and always closes it. */
+/** Errors a page throws when it reloaded under us. A server that stopped answering (net::ERR_...) is not one of them. */
+const RELOAD = /Execution context was destroyed|because of a navigation|frame was detached|Target closed|has been closed/i;
+export const isReload = (e: unknown) => RELOAD.test((e as Error).message) && !/net::ERR_/.test((e as Error).message);
+
+/**
+ * Runs `fn` with a browser session and always closes it. It first waits for the sources to settle, and when the
+ * page reloads under `fn` (a dev server picking up an edit) it runs `fn` again, so `fn` must be safe to repeat.
+ */
 export async function withSession<T>(cfg: Config, fn: (s: Session) => Promise<T>): Promise<T> {
-  const session = await openSession(cfg);
-  try {
-    return await fn(session);
-  } finally {
-    await session.close();
+  for (let attempt = 1; ; attempt++) {
+    await settle(cfg);
+    const session = await openSession(cfg);
+    try {
+      return await fn(session);
+    } catch (e) {
+      if (!isReload(e)) throw e;
+      if (attempt >= 3) throw new CliError("the page kept reloading while it was being read; try again when the edits are done");
+      console.error("beatclip: the page reloaded while it was being read; trying again");
+    } finally {
+      await session.close();
+    }
   }
 }
 
@@ -132,19 +148,19 @@ export const seek = (page: Page, cfg: Config, t: number) =>
 /** Reads a hook's value from the page (duration, shot list). */
 export const readHook = <T>(page: Page, name: string) => page.evaluate((n) => (window as any)[n], name) as Promise<T>;
 
-/** Draws time `t` and returns the page's picture as a JPEG at the render quality. */
-export async function shootJpeg(page: Page, cfg: Config, t: number): Promise<Buffer> {
+/** Draws time `t` and returns the page's picture (or a rectangle of it, in page pixels) as a JPEG at the render quality. */
+export async function shootJpeg(page: Page, cfg: Config, t: number, crop?: Crop): Promise<Buffer> {
   await seek(page, cfg, t);
-  return page.screenshot({ type: "jpeg", quality: cfg.render.quality });
+  return page.screenshot({ type: "jpeg", quality: cfg.render.quality, ...(crop ? { clip: { x: crop.x, y: crop.y, width: crop.w, height: crop.h } } : {}) });
 }
 
 /**
  * Saves the page's picture of time `t` as a JPEG `width` pixels wide. The page (opened at the render scale) is shot
  * at full size and scaled afterwards: a page drawn small renders text differently from a scaled-down video frame.
  */
-export async function shootPicture(page: Page, cfg: Config, t: number, width: number, out: string): Promise<void> {
+export async function shootPicture(page: Page, cfg: Config, t: number, width: number, out: string, crop?: Crop): Promise<void> {
   const full = out.replace(/\.jpg$/, ".full.jpg");
-  writeFileSync(full, await shootJpeg(page, cfg, t));
+  writeFileSync(full, await shootJpeg(page, cfg, t, crop));
   await scalePicture(full, width, out);
   rmSync(full);
 }

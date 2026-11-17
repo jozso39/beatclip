@@ -13,7 +13,7 @@ const HELP = `beatclip: edit code-rendered music videos from timestamped notes
   beatclip analyze beats <audio>            write a beat-times file with librosa (optional, needs Python)
   beatclip frames [times..] [--from --to --every] [--shot id] [--word line.n --window s] [--beats]
                     [--video a.mp4] [--compare b.mp4]          labelled contact sheets, live page or rendered file
-  beatclip render [--from t --to t] [--shot id] [--notes] [--out file]   full or partial render via the frame cache
+  beatclip render [--from t --to t] [--shot id] [--notes] [--changed] [--excerpt]   full or partial render via the frame cache
   beatclip notes add|list|set|proof|report  the ledger of change notes
   beatclip diff <a.mp4> <b.mp4>             time ranges where two drafts differ, and which no note explains
   beatclip check [--update-allow]           lyric-word sync check and probe rules
@@ -23,7 +23,8 @@ const HELP = `beatclip: edit code-rendered music videos from timestamped notes
   beatclip init [--url <page>]              write a starter beatclip.config.json here
   beatclip docs                             the full manual
 
-Times are written 1:07, 1:07.5 or 67.5. Every command takes --json and --project <folder with beatclip.config.json>.`;
+Times are written 1:07, 1:07.5 or 67.5. Every command takes --json, --project <folder with beatclip.config.json>
+and --profile <name> (a set of overrides under "profiles" in the config, with its own frame cache).`;
 
 async function main(argv: string[]): Promise<Result> {
   const args = new Args(argv);
@@ -31,7 +32,7 @@ async function main(argv: string[]): Promise<Result> {
   if (!command || command === "help" || args.has("help")) return { data: { help: HELP }, text: HELP };
   const cwd = process.cwd();
   const explicit = args.str("project") ?? process.env.BEATCLIP_PROJECT;
-  const config = (): Config => loadConfig(findConfig(explicit, cwd));
+  const config = (): Config => loadConfig(findConfig(explicit, cwd), args.str("profile") ?? process.env.BEATCLIP_PROFILE);
   const project = () => loadProject(config());
 
   switch (command) {

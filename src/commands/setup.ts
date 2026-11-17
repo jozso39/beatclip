@@ -5,7 +5,8 @@ import type { Args } from "../args";
 import { readHook, withSession } from "../browser";
 import { CONFIG_NAME, findConfig, loadConfig, type Config } from "../config";
 import { run } from "../ffmpeg";
-import { loadGrid, loadLines, sourceFiles } from "../project";
+import { loadGrid, loadLines } from "../project";
+import { sourceFiles } from "../sources";
 import { CliError } from "../time";
 import type { Result } from "./lookup";
 
@@ -91,6 +92,12 @@ async function checkProject(cfg: Config, say: (level: Finding["level"], what: st
       say(typeof duration === "number" && duration > 0 ? "ok" : "FAIL", `window.${cfg.page.duration}`, typeof duration === "number" ? `${duration} s` : `is ${typeof duration}, must be the length in seconds`);
       const seekType = await page.evaluate((n) => typeof (window as any)[n], cfg.page.seek);
       say(seekType === "function" ? "ok" : "FAIL", `window.${cfg.page.seek}`, seekType === "function" ? "is a function" : `is ${seekType}, must be a function of the time in seconds`);
+      if (cfg.render.scale > 1) {
+        // A canvas whose bitmap is as wide as its box is drawn at scale 1 and only stretched: soft in a high-resolution render.
+        const scaled = await s.open(cfg.render.scale);
+        const soft = await scaled.evaluate(() => [...document.querySelectorAll("canvas")].filter((c) => c.clientWidth > 0 && c.width <= c.clientWidth).map((c) => `${c.id || c.className || "canvas"} ${c.width}x${c.height}`));
+        say(soft.length ? "warn" : "ok", `canvases at scale ${cfg.render.scale}`, soft.length ? `${soft.length} would come out soft (bitmap no larger than the box; multiply it by devicePixelRatio): ${soft.join(", ")}` : "none is drawn at a lower resolution than the render");
+      }
       if (cfg.shots) say("ok", "shots", `${cfg.shots.length} listed in the config`);
       else if (!cfg.page.shots) say("FAIL", "shots", 'set "page.shots" to the name of a window hook, or list "shots" in the config');
       else {
@@ -124,8 +131,8 @@ export async function doctor(args: Args, cwd: string, explicit: string | undefin
 
   let cfg: Config | null = null;
   try {
-    cfg = loadConfig(findConfig(explicit, cwd));
-    say("ok", "config", cfg.file);
+    cfg = loadConfig(findConfig(explicit, cwd), args.str("profile") ?? process.env.BEATCLIP_PROFILE);
+    say("ok", "config", `${cfg.file}${cfg.profile ? ` (profile ${cfg.profile})` : ""}`);
   } catch (e) {
     say("warn", "config", `${(e as Error).message}; run \`beatclip init\` in the project folder`);
   }
