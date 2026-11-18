@@ -50,9 +50,9 @@ export async function diff(p: Project, args: Args, cwd: string): Promise<Result>
   const ranges = differingRanges(diffs, ia.fps, threshold, Math.round((args.num("gap") ?? 0.5) * ia.fps));
 
   // Which notes this comparison can say something about: not the ones given up (rejected, superseded),
-  // and not the ones whose change went into another draft than the second file.
+  // and not the ones whose change went into another draft than the second file. An open note is not done in any draft yet.
   const ledger = loadNotes(p.cfg).filter((n) => n.status !== "rejected" && n.status !== "superseded");
-  const notes = ledger.filter((n) => n.doneIn === undefined || resolve(p.cfg.root, n.doneIn) === b);
+  const notes = ledger.filter((n) => n.status === "open" || n.doneIn === undefined || resolve(p.cfg.root, n.doneIn) === b);
   const elsewhere = ledger.length - notes.length;
   const explained = ranges.map((range) => ({
     ...range,

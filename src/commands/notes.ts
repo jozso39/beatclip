@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, relative, resolve } from "node:path";
 import type { Args } from "../args";
 import { shootPicture, withSession } from "../browser";
 import type { Config } from "../config";
 import { difference, grabFrame, pool, probeVideo } from "../ffmpeg";
+import { writeAtomic } from "../files";
 import { describe, frameAt, shotAt, type Project } from "../project";
 import { uniquePath } from "../sheet";
 import { CliError, fmtSpan, fmtTime, parseTime, round3, stamp } from "../time";
@@ -51,12 +52,7 @@ export function loadNotes(cfg: Config): Note[] {
   return notes;
 }
 
-/** Writes the ledger through a temporary file, so an interrupted write cannot leave half a ledger. */
-function saveNotes(cfg: Config, notes: Note[]) {
-  const tmp = `${cfg.notes}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ notes }, null, 1) + "\n");
-  renameSync(tmp, cfg.notes);
-}
+const saveNotes = (cfg: Config, notes: Note[]) => writeAtomic(cfg.notes, JSON.stringify({ notes }, null, 1) + "\n");
 
 export function noteById(notes: Note[], id: string | number): Note {
   const note = notes.find((n) => n.id === Number(id));
@@ -64,17 +60,23 @@ export function noteById(notes: Note[], id: string | number): Note {
   return note;
 }
 
-/** The notes named by "3", "1,4", "2-6", a mix of those, or "all". */
-export function notesByIds(notes: Note[], spec: string): Note[] {
-  if (spec === "all") return notes;
-  const ids = spec.split(",").flatMap((part) => {
+/**
+ * The notes named by "3", "1,4", "2-6" or a mix of those, in ledger order; a range takes the notes there are in it.
+ * "all" is `everyone`: the notes of the round in hand, never the settled ones of earlier rounds.
+ */
+export function notesByIds(notes: Note[], spec: string, everyone: Note[]): Note[] {
+  if (spec === "all") return everyone;
+  const ids = new Set<number>();
+  for (const part of spec.split(",")) {
     const m = part.match(/^(\d+)(?:-(\d+))?$/);
     if (!m) throw new CliError(`"${spec}" does not name notes (write 3, 1,4, 2-6 or all)`);
     const [a, b] = [Number(m[1]), Number(m[2] ?? m[1])];
     if (b < a) throw new CliError(`the range ${part} runs backwards`);
-    return Array.from({ length: b - a + 1 }, (_, i) => a + i);
-  });
-  return [...new Set(ids)].map((id) => noteById(notes, id));
+    const found = notes.filter((n) => n.id >= a && n.id <= b);
+    if (!found.length) throw new CliError(`no note${a === b ? ` ${a}` : `s in ${part}`} (notes: ${notes.map((n) => n.id).join(", ") || "none yet"})`);
+    for (const n of found) ids.add(n.id);
+  }
+  return notes.filter((n) => ids.has(n.id));
 }
 
 /** Changes notes in the ledger as it is on disk right now (another command may have written it meanwhile) and saves it. */
@@ -164,7 +166,10 @@ async function proofDiff(cfg: Config, before: Proof[], after: Proof[]): Promise<
   });
   if (!pairs.length) return undefined;
   const aspect = cfg.page.width / cfg.page.height;
-  const diffs = await pool(pairs, 6, ([b, a]) => difference(resolve(cfg.root, b.file), resolve(cfg.root, a.file), aspect));
+  const files = pairs.map((pair) => pair.map((pr) => resolve(cfg.root, pr.file)));
+  // A proof picture that was deleted since cannot be compared; the note then simply has no difference on record.
+  if (!files.flat().every((f) => existsSync(f))) return undefined;
+  const diffs = await pool(files, 6, ([b, a]) => difference(b, a, aspect));
   return round3(Math.max(...diffs));
 }
 
@@ -203,9 +208,11 @@ function add(p: Project, args: Args): Result {
 /** `notes set <ids> [status]`: status and the draft it was done in for any number of notes; wording for one. */
 function set(p: Project, args: Args, cwd: string): Result {
   const cfg = p.cfg;
-  const chosen = notesByIds(loadNotes(cfg), args.take("note ids (3, 1,4, 2-6 or all)"));
+  const ledger = loadNotes(cfg);
+  const chosen = notesByIds(ledger, args.take("note ids (3, 1,4, 2-6 or all)"), pendingNotes(ledger));
   const status = args.rest.length ? asStatus(args.rest.shift()!) : undefined;
   args.noMore();
+  if (!chosen.length) throw new CliError("all means the open and done notes, and there are none; name the notes by id");
   const single = ["shows", "text", "to"].find((o) => args.has(o));
   if (single && chosen.length > 1) throw new CliError(`--${single} applies to one note; ${chosen.length} were named`);
   if (args.has("by") !== (status === "superseded")) throw new CliError("a superseded note names its replacement: notes set <id> superseded --by <id of the new note>");
@@ -217,6 +224,8 @@ function set(p: Project, args: Args, cwd: string): Result {
     if (by !== undefined) n.supersededBy = by;
     else if (status) delete n.supersededBy;
     if (video) n.doneIn = relative(cfg.root, video);
+    // A note sent back to open is not done in any draft any more.
+    else if (status === "open") delete n.doneIn;
     if (args.has("shows")) n.shows = args.str("shows");
     if (args.has("text")) n.text = args.str("text")!;
     if (args.has("to")) {
@@ -231,11 +240,15 @@ function set(p: Project, args: Args, cwd: string): Result {
 /** `notes proof <ids> before|after`: frames at each note's time (or at every --at for one note). */
 async function proof(p: Project, args: Args, cwd: string): Promise<Result> {
   const cfg = p.cfg;
-  const chosen = notesByIds(loadNotes(cfg), args.take("note ids (3, 1,4, 2-6 or all)"));
+  const spec = args.take("note ids (3, 1,4, 2-6 or all)");
   const side = args.take("before or after");
   args.noMore();
   if (side !== "before" && side !== "after") throw new CliError(`proof is "before" or "after", not "${side}"`);
-  if (!chosen.length) throw new CliError("there are no notes to take proofs for");
+  // "all" never reaches back into earlier rounds: a before frame is for a change not made yet (open notes),
+  // an after frame for one not confirmed yet (open and done notes).
+  const ledger = loadNotes(cfg);
+  const chosen = notesByIds(ledger, spec, side === "before" ? ledger.filter((n) => n.status === "open") : pendingNotes(ledger));
+  if (!chosen.length) throw new CliError(`all means the ${side === "before" ? "open" : "open and done"} notes, and there are none; name the notes by id`);
   const at = args.all("at").map(parseTime);
   if (at.length && chosen.length > 1) throw new CliError("--at gives the moments of one note; name one note with it");
   const video = videoArg(args, cwd);
@@ -250,7 +263,9 @@ async function proof(p: Project, args: Args, cwd: string): Promise<Result> {
     const diff = diffs.get(n.id);
     if (diff === undefined) delete n.diff;
     else n.diff = diff;
+    // The after frame says where the change is: in that draft, or (taken from the live page) in none yet.
     if (side === "after" && video) n.doneIn = relative(cfg.root, video);
+    else if (side === "after") delete n.doneIn;
   });
   const lines = changed.flatMap((n) => {
     const alike = n.diff === undefined ? "" : `; before and after: diff ${n.diff.toFixed(1)}${n.diff < cfg.differs ? "  (they look unchanged: the change does not read in the frame)" : ""}`;

@@ -206,7 +206,7 @@ Times are snapped to video frames. With `--compare` the two pictures of a time s
 - `--crop x,y,w,h` (in page pixels) shows only that rectangle of every frame, from the page and from videos alike, for checking one small element. `beatclip probe` tells you where an element is.
 - A sheet is never wider than 2000 px (`--max-width`), so it stays readable when it is viewed scaled down: if `--cols` and `--width` ask for more, it uses fewer columns, then narrower pictures, and says so.
 - Other options: `--cols`, `--rows` (per sheet, default 6; more tiles make more sheets), `--width` (picture width, default 480), `--out <file.png>`.
-- Right after a source edit the dev server is still reloading the page: `frames` (like every command that opens the page) waits until the sources have been quiet for `render.settleMs` and starts over if the page reloads under it.
+- Right after a source edit the dev server is still reloading the page: `frames` (like every command that opens the page) waits until the sources have been quiet for `render.settleMs`, and shoots again from the start if the page reloads or a source file changes while it is shooting, so one sheet never mixes two versions of the page.
 
 Sheets are written to `out/sheets/<timestamp>-<what>.png`, a new name every time. If any capture fails the command exits with an error and writes nothing, and an existing file is never overwritten:
 
@@ -267,7 +267,7 @@ encode       0.1 s  (only the excerpt, 90 frames)
 total        1.9 s
 ```
 
-`--changed` is for edits whose reach you do not know, such as a component used in many shots. It compares the first frame, the last frame and `render.changedSamples` frames in between (`--samples <n>`) of every shot with the cache, re-shoots every shot where one differs, and renders nothing when none does. A change that lasts only a few frames between two samples can be missed; raise `--samples` or name the range when that matters. Here the bar was recoloured, which touches two shots and two of the three segments:
+`--changed` is for edits whose reach you do not know, such as a component used in many shots. It compares the first frame, the last frame and `render.changedSamples` frames in between (`--samples <n>`) of every shot (and of the time before the first shot, if the shot list does not start at 0) with the cache, re-shoots every shot where one differs, and renders nothing when none does. Shot ids must be unique. A change that lasts only a few frames between two samples can be missed; raise `--samples` or name the range when that matters. Here the bar was recoloured, which touches two shots and two of the three segments:
 
 ```
 $ beatclip render --changed
@@ -308,15 +308,17 @@ beatclip notes add 0:04 "the ball should be orange"         # --to <time> makes 
 beatclip notes list                                         # --status open|done|verified|rejected|superseded
 beatclip notes proof 1 before --video out/demo-1.mp4        # a frame at the note's time; without --video from the live page
 beatclip notes proof 1 before --video out/demo-1.mp4 --at 3.75 --at 4 --at 4.25   # several moments of a movement
-beatclip notes proof all before --video out/demo-1.mp4      # a before frame for every note in one go
+beatclip notes proof all before --video out/demo-1.mp4      # a before frame for every open note in one go
 beatclip notes proof 1 after --video out/demo-2.mp4         # also records demo-2.mp4 as the draft the note was done in
 beatclip notes set 1 done --shows "an orange ball on the floor line under the word ball"   # also --text, --to <time>, --to none
-beatclip notes set 1-10 verified                            # several notes: 3, 1,4, 2-6 or all
+beatclip notes set 1-10 verified                            # several notes: 3, 1,4, 2-6 (the notes there are in the range) or all
 beatclip notes set 3 done --video out/demo-2.mp4            # record the draft without taking a proof
 beatclip notes set 11 superseded --by 12                    # note 11 was replaced by note 12
 beatclip notes remove 2
 beatclip notes report                                       # --out report.md
 ```
+
+`all` means the round in hand, never the notes settled in earlier rounds (verified, rejected, superseded), whose proofs and drafts stay as they are: for `proof … before` it is the open notes, for `proof … after` and `set` the open and done ones. To change a settled note, name it by id. Setting a note back to `open` forgets the draft it was done in.
 
 ```
 $ beatclip notes add 0:04 "the ball should be orange"

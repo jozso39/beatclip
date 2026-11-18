@@ -166,6 +166,10 @@ group("render planning", () => {
     const picks = shotSamples(demoProject(), 2);
     expect(picks).toEqual([0, 30, 59, 89, 90, 120, 149, 179, 180, 210, 239, 269, 270, 300, 329, 359]);
   });
+  test("--changed also samples the time before the first shot", () => {
+    const p = demoProject();
+    expect(shotSamples({ ...p, shots: p.shots.slice(1) }, 2)).toEqual(shotSamples(p, 2));
+  });
   test("space a full render needs: missing frames, a third for the video, a gigabyte spare", () => {
     expect(spaceNeeded(4e9, 0)).toBe(4e9 + 1.2e9 + 1e9);
     expect(spaceNeeded(4e9, 4e9)).toBe(1.2e9 + 1e9);
@@ -184,18 +188,22 @@ group("sheets", () => {
     expect(fitSheet(4, 620, 2, 2600)).toMatchObject({ cols: 2, width: 620 });
     expect(fitSheet(2, 1200, 2, 2000)).toMatchObject({ cols: 1, width: 991 });
     expect(fitSheet(4, 620, 2, 2000).changed).toContain("1 column of 620 px");
+    expect(fitSheet(4, 480, 1, 10).width).toBeLessThan(16);
   });
 });
 
 group("notes", () => {
-  const notes = [1, 2, 3, 4, 5].map((id) => ({ id }) as Note);
+  const notes = [1, 2, 3, 5, 6].map((id) => ({ id }) as Note);
   test("ids as single numbers, lists, ranges and all", () => {
-    const ids = (spec: string) => notesByIds(notes, spec).map((n) => n.id);
+    const ids = (spec: string) => notesByIds(notes, spec, notes.slice(3)).map((n) => n.id);
     expect(ids("3")).toEqual([3]);
-    expect(ids("1,4")).toEqual([1, 4]);
-    expect(ids("2-4,1,2")).toEqual([2, 3, 4, 1]);
-    expect(ids("all")).toEqual([1, 2, 3, 4, 5]);
-    for (const bad of ["x", "4-2", "9", "1-9"]) expect(() => notesByIds(notes, bad)).toThrow();
+    expect(ids("1,5")).toEqual([1, 5]);
+    expect(ids("2-3,1,2")).toEqual([1, 2, 3]);
+    // "all" is whatever the caller counts as the round in hand; a range takes the notes that exist in it.
+    expect(ids("all")).toEqual([5, 6]);
+    expect(ids("2-5")).toEqual([2, 3, 5]);
+    expect(ids("1-99999999999")).toEqual([1, 2, 3, 5, 6]);
+    for (const bad of ["x", "4-2", "9", "4", "7-9", "all,3", "2-"]) expect(() => notesByIds(notes, bad, notes)).toThrow();
   });
 });
 

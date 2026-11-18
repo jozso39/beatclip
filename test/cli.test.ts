@@ -346,6 +346,35 @@ test("frames: a crop, a capped sheet width, and waiting after a source edit", as
   const soon = await cli("frames", "1");
   expect(soon.code).toBe(0);
   expect(soon.err).toContain("waiting for the page to settle");
+  expect((await cli("frames", "1", "2", "--max-width", "10")).json.error).toContain("leaves no room");
+}, 120000);
+
+test("frames shoots the live page again when a source changes under it, and writes one sheet", async () => {
+  // Let the last edit settle and the shot list be read, so the edit below lands in the middle of the shooting.
+  await Bun.sleep(1600);
+  await cli("at", "1");
+  const had = sheets().length;
+  const running = cli("frames", "--from", "0", "--to", "12", "--every", "0.05", "--all");
+  await Bun.sleep(2500);
+  recolour("SQUARE", "#00c2ff");
+  const result = await running;
+  expect(result.code).toBe(0);
+  expect(result.err).toContain("the page reloaded while it was being read; trying again");
+  expect(sheets().length - had).toBe(result.json.sheets.length);
+}, 120000);
+
+test("render: a damaged segment index is rebuilt, and a repeated shot id is refused", async () => {
+  await cli("render", "--full");
+  writeFileSync(resolve(dir, "out/cache/segments/segments.json"), '{"seg-0000');
+  const again = await cli("render", "--shot", "intro");
+  expect(again.code).toBe(0);
+  expect(again.json.segments).toEqual({ segments: 3, encoded: 3 });
+
+  const config = resolve(dir, "beatclip.config.json");
+  const kept = readFileSync(config, "utf8");
+  writeFileSync(config, JSON.stringify({ ...JSON.parse(kept), duration: 12, shots: [{ id: "a", s: 0 }, { id: "a", s: 6 }] }));
+  expect((await cli("at", "1")).json.error).toContain('two shots are called "a"');
+  writeFileSync(config, kept);
 }, 120000);
 
 test("notes: several proof frames, several notes at once, drafts and superseded notes", async () => {
@@ -380,6 +409,28 @@ test("notes: several proof frames, several notes at once, drafts and superseded 
   expect(diff.notesWithoutDifference).toEqual([]);
   expect(diff.notesDoneElsewhere).toBe(total);
   expect(diff.ranges.find((r: any) => r.shots.includes("bounce")).notes).toEqual([a]);
+
+  // "all" is the round in hand: the notes settled in earlier rounds keep their proofs and their draft.
+  await cli("notes", "set", String(a), "verified");
+  const settled = (await cli("notes", "list")).json.filter((n: any) => n.status === "verified" || n.status === "superseded");
+  const c = (await cli("notes", "add", "10", "the bar should be taller")).json.note.id;
+  expect((await cli("notes", "proof", "all", "before", "--video", fresh)).json.id).toBe(c);
+  expect((await cli("notes", "proof", "all", "after", "--video", fresh)).json.id).toBe(c);
+  expect((await cli("notes", "list")).json.filter((n: any) => settled.some((s: any) => s.id === n.id))).toEqual(settled);
+  expect((await cli("notes", "set", "all", "done")).json.id).toBe(c);
+  expect((await cli("notes", "set", `${c},${c + 5}`, "done")).json.error).toContain(`no note ${c + 5}`);
+  await cli("notes", "remove", String(c));
+  expect((await cli("notes", "set", `${a}-${c + 3}`)).json.map((n: any) => n.id)).toEqual([a, b]);
+
+  // A note sent back to open is not tied to a draft any more, and a diff against the next draft counts it in.
+  expect((await cli("notes", "set", String(a), "open")).json.doneIn).toBeUndefined();
+  expect((await cli("diff", old, fresh)).json.ranges.find((r: any) => r.shots.includes("bounce")).notes).toEqual([a]);
+  // A proof picture deleted since does not stop new proofs from being taken.
+  const gone = (await cli("notes", "list")).json.find((n: any) => n.id === a).before[0].file;
+  rmSync(resolve(dir, gone));
+  const retaken = await cli("notes", "proof", String(a), "after", "--video", fresh);
+  expect(retaken.code).toBe(0);
+  expect(retaken.json.diff).toBeUndefined();
 }, 180000);
 
 test("check: known exceptions pass, new problems fail, probes measure boxes", async () => {

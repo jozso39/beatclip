@@ -255,10 +255,16 @@ async function compareWithCache(session: Session, p: Project, samples: number[],
 /** The frames of a shot, first to one past the last. */
 const shotFrames = (p: Project, s: { s: number; e: number }): Range => [Math.max(0, Math.floor(s.s * p.fps)), Math.min(frameCount(p), Math.ceil(s.e * p.fps))];
 
-/** For `render --changed`: every shot's first and last frame and `perShot` frames spread between them. */
+/** What stands before the first shot, when the shot list does not start at 0. */
+const BEFORE_SHOTS = "(before the first shot)";
+
+/** The stretch of video around a time that is re-shot as one piece: its shot, or the time before the first shot. */
+const stretchAt = (p: Project, t: number): { s: number; e: number } => shotAt(p, t) ?? { s: 0, e: p.shots[0]?.s ?? p.duration };
+
+/** For `render --changed`: the first and last frame of every shot (and of the time before the first one) and `perShot` frames spread between them. */
 export function shotSamples(p: Project, perShot: number): number[] {
   const picks = new Set<number>();
-  for (const shot of p.shots) {
+  for (const shot of p.shots[0]?.s === 0 ? p.shots : [stretchAt(p, 0), ...p.shots]) {
     const [a, end] = shotFrames(p, shot);
     const b = end - 1;
     if (b < a) continue;
@@ -271,8 +277,8 @@ export function shotSamples(p: Project, perShot: number): number[] {
 /** Compares samples of every shot with the cache and returns the shots where the page now draws something else. */
 async function changedShots(session: Session, p: Project, perShot: number): Promise<{ ranges: Range[]; shots: string[]; checked: Checked }> {
   const checked = await compareWithCache(session, p, shotSamples(p, perShot), "scan");
-  const shots = [...new Set(checked.differing.map((d) => d.shot).filter((id): id is string => !!id))];
-  return { ranges: mergeRanges(shots.map((id) => shotFrames(p, shotById(p, id)))), shots, checked };
+  const shots = [...new Set(checked.differing.map((d) => d.shot ?? BEFORE_SHOTS))];
+  return { ranges: mergeRanges(checked.differing.map((d) => shotFrames(p, stretchAt(p, d.t)))), shots, checked };
 }
 
 /** The output file: "{n}" in the pattern becomes the first number not taken yet. */
@@ -382,10 +388,7 @@ async function shootChecked(session: Session, p: Project, start: Range[], fullBe
     console.error(`check: ${result.differing.length} of ${result.samples} frames outside ${spans(p, out.ranges)} no longer match the cache: ${listed(result.differing)}`);
     if (!opts.widen) throw new CliError(`frames outside the rendered range changed too (${listed(result.differing)}); render those ranges as well, or drop --no-widen`);
 
-    const widened = mergeRanges([...out.ranges, ...result.differing.map((d): Range => {
-      const s = shotAt(p, d.t);
-      return s ? shotFrames(p, s) : [0, total];
-    })]);
+    const widened = mergeRanges([...out.ranges, ...result.differing.map((d) => shotFrames(p, stretchAt(p, d.t)))]);
     const next = ++widenings > 2 || sizeOf(widened) > 0.6 * total ? everything : widened;
     if (next === everything) out.fullBecause = `frames outside the ranges kept differing from the cache (${listed(result.differing)})`;
     console.error(next === everything ? "check: falling back to a full render" : `check: widening to ${spans(p, next)}`);
@@ -469,7 +472,7 @@ export async function render(p: Project, args: Args, cwd: string): Promise<Resul
         const started = Date.now();
         scan = await changedShots(session, p, args.num("samples") ?? cfg.render.changedSamples);
         scanMs = Date.now() - started;
-        const hits = (id: string) => scan!.checked.differing.filter((d) => d.shot === id);
+        const hits = (id: string) => scan!.checked.differing.filter((d) => (d.shot ?? BEFORE_SHOTS) === id);
         console.error(scan.shots.length ? `scan: ${scan.shots.length} shots differ from the cache: ${scan.shots.map((id) => `${id} (${hits(id).length} frames, first at ${hits(id)[0].time})`).join(", ")}` : "scan: no shot differs from the cache");
         start = mergeRanges([...scan.ranges, ...(before?.dirty ?? [])]);
       } else start = mergeRanges([...asked, ...(before?.dirty ?? [])]);
@@ -492,13 +495,14 @@ export async function render(p: Project, args: Args, cwd: string): Promise<Resul
         else segments = await encodeSegments(p, out);
       }
       encodeMs = Date.now() - started;
+      // Still under the lock: another render must not start on a cache that is about to go.
+      if (args.has("drop-cache")) {
+        rmSync(cfg.out.cache, { recursive: true, force: true });
+        rmSync(cfg.out.segments, { recursive: true, force: true });
+      }
     }
   } finally {
     unlock();
-  }
-  if (out && args.has("drop-cache")) {
-    rmSync(cfg.out.cache, { recursive: true, force: true });
-    rmSync(cfg.out.segments, { recursive: true, force: true });
   }
 
   const scanLine = scan ? [`scan         ${secs(scanMs).toFixed(1)} s  (${scan.checked.samples} frames compared with the cache; changed shots: ${scan.shots.join(", ") || "none"})`] : [];

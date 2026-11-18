@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { Config } from "./config";
+import { writeAtomic } from "./files";
 import { must, pool } from "./ffmpeg";
 import { frameCount, type Project } from "./project";
 import { CliError } from "./time";
@@ -75,19 +76,25 @@ export async function encodeSegments(p: Project, out: string): Promise<{ segment
   const dir = cfg.out.segments;
   mkdirSync(dir, { recursive: true });
   const index = resolve(dir, "segments.json");
-  const known: Record<string, string> = existsSync(index) ? JSON.parse(readFileSync(index, "utf8")) : {};
+  // An index that cannot be read (a write cut short) is no index: every segment is encoded again.
+  let known: Record<string, string> = {};
+  try {
+    if (existsSync(index)) known = JSON.parse(readFileSync(index, "utf8"));
+  } catch {
+    console.error(`encode: ${index} cannot be read; encoding every segment again`);
+  }
   const plan = planSegments(p);
   const stale = plan.filter((s) => known[s.file] !== s.signature || !existsSync(resolve(dir, s.file)));
   // Three encoders side by side: each already uses several cores, more would only fight over them.
   await pool(stale, 3, async (s) => {
     await writeVideo([...framesIn(p, s.first), ...pictureOut(cfg, s.count), "-an"], resolve(dir, s.file), `encoding frames ${s.first}–${s.first + s.count - 1}`);
     known[s.file] = s.signature;
-    writeFileSync(index, JSON.stringify(known));
+    writeAtomic(index, JSON.stringify(known));
   });
   // Segments of an earlier plan (another length, another segment size) are of no use any more.
   const wanted = new Set(plan.map((s) => s.file));
   for (const f of readdirSync(dir)) if (/^seg-.*\.mp4$/.test(f) && !wanted.has(f)) rmSync(resolve(dir, f));
-  writeFileSync(index, JSON.stringify(Object.fromEntries(plan.map((s) => [s.file, known[s.file]]))));
+  writeAtomic(index, JSON.stringify(Object.fromEntries(plan.map((s) => [s.file, known[s.file]]))));
 
   const list = resolve(dir, "join.txt");
   writeFileSync(list, plan.map((s) => `file '${resolve(dir, s.file).replaceAll("'", "'\\''")}'`).join("\n") + "\n");

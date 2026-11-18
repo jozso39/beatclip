@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import type { Config } from "./config";
 import { atExit, identify, recordAlive, type ProcessId } from "./exit";
 import { scalePicture, type Crop } from "./ffmpeg";
-import { settle } from "./sources";
+import { changedSource, settle, snapshotSources } from "./sources";
 import { CliError } from "./time";
 
 async function reachable(url: string): Promise<boolean> {
@@ -124,20 +124,37 @@ export const isReload = (e: unknown) => RELOAD.test((e as Error).message) && !/n
 /**
  * Runs `fn` with a browser session and always closes it. It first waits for the sources to settle, and when the
  * page reloads under `fn` (a dev server picking up an edit) it runs `fn` again, so `fn` must be safe to repeat.
+ * A reload does not always throw: the page may simply carry on as its new version. So a navigation of any page
+ * `fn` opened, or a source file that changed meanwhile, counts as one too, whatever `fn` returned or threw.
  */
 export async function withSession<T>(cfg: Config, fn: (s: Session) => Promise<T>): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     await settle(cfg);
+    const before = snapshotSources(cfg);
     const session = await openSession(cfg);
+    let navigated = false;
+    const watched: Session = {
+      ...session,
+      async open(scale) {
+        const page = await session.open(scale);
+        const main = page.mainFrame();
+        page.on("framenavigated", (f) => {
+          if (f === main) navigated = true;
+        });
+        return page;
+      },
+    };
+    const reloaded = () => navigated || changedSource(before, snapshotSources(cfg)) !== null;
     try {
-      return await fn(session);
+      const result = await fn(watched);
+      if (!reloaded()) return result;
     } catch (e) {
-      if (!isReload(e)) throw e;
-      if (attempt >= 3) throw new CliError("the page kept reloading while it was being read; try again when the edits are done");
-      console.error("beatclip: the page reloaded while it was being read; trying again");
+      if (!isReload(e) && !reloaded()) throw e;
     } finally {
       await session.close();
     }
+    if (attempt >= 3) throw new CliError("the page kept reloading while it was being read; try again when the edits are done");
+    console.error("beatclip: the page reloaded while it was being read; trying again");
   }
 }
 

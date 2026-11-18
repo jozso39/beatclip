@@ -93,7 +93,8 @@ Skip this when `beatclip doctor` already says `ready`.
 - **Do not edit source files while a render is running** unless you mean to: the render notices and
   shoots the affected ranges again, which costs time.
 - **Right after an edit** every command that opens the page waits until the dev server has settled and
-  retries if the page reloads under it. "waiting for the page to settle" is not an error.
+  shoots again if the page reloads or a source changes under it. "waiting for the page to settle" and
+  "the page reloaded while it was being read; trying again" are not errors.
 - **Do not know how far an edit reaches** (a shared component, a style, a helper)? Use
   `beatclip render --changed`; do not guess ranges and do not fall back to `--full`.
 
@@ -106,8 +107,8 @@ beatclip notes add 1:07 "the ball should land on the beat"
 # 2. Find out what each note is about: shot, source file and line, lyric word, beat
 beatclip at 1:07
 
-# 3. Keep the frames as they are now, from the last draft: all notes at once,
-#    and several moments for a note about a movement
+# 3. Keep the frames as they are now, from the last draft: all open notes at once
+#    (notes settled in earlier rounds are left alone), and several moments for a note about a movement
 beatclip notes proof all before --video out/draft-3.mp4
 beatclip notes proof 1 before --video out/draft-3.mp4 --at 1:06.75 --at 1:07 --at 1:07.25
 
@@ -135,7 +136,9 @@ beatclip notes report
 
 Statuses are `open`, `done`, `verified` (the user confirmed it), `rejected` (deliberately not done) and
 `superseded` (replaced by a newer note: `beatclip notes set 11 superseded --by 12`). After the user
-confirms a round: `beatclip notes set 1-10 verified`.
+confirms a round: `beatclip notes set all verified` (`all` is the open and done notes; notes settled in
+earlier rounds are never touched by `all`, name them by id to change them). A note the user sends back:
+`beatclip notes set 3 open`.
 
 ## 5. Commands
 
@@ -201,8 +204,8 @@ render; `--no-verify` and `--no-widen` change the check.
 | --- | --- |
 | `beatclip notes add <time> "<text>" [--to <time>]` | adds a note, prints its id and where it lands |
 | `beatclip notes list [--status open]` | the ledger |
-| `beatclip notes proof <ids> before\|after [--video <file>] [--at <time> ...]` | saves a frame at each note's time (live page without `--video`); `--at` may repeat for one note; with both sides present it prints their difference; an after proof from a video records that draft |
-| `beatclip notes set <ids> [status] [--video <draft>] [--by <id>]` | status for one or many notes (`3`, `1,4`, `2-6`, `all`); `--video` records the draft; `superseded` needs `--by` |
+| `beatclip notes proof <ids> before\|after [--video <file>] [--at <time> ...]` | saves a frame at each note's time (live page without `--video`); `--at` may repeat for one note; `all` is the open notes for `before`, the open and done ones for `after`; with both sides present it prints their difference; an after proof from a video records that draft |
+| `beatclip notes set <ids> [status] [--video <draft>] [--by <id>]` | status for one or many notes (`3`, `1,4`, `2-6` = the notes there are in that range, `all` = the open and done ones); `--video` records the draft; `open` forgets it; `superseded` needs `--by` |
 | `beatclip notes set <id> [--shows "<what the frame shows>"] [--text ..] [--to <time>\|none]` | wording of one note |
 | `beatclip notes remove <id>` | deletes a note |
 | `beatclip notes report [--out report.md]` | the Markdown table of all notes |

@@ -154,6 +154,8 @@ export interface Project {
 export async function loadProject(cfg: Config): Promise<Project> {
   const facts = await loadFacts(cfg);
   const defs = [...facts.shots].sort((a, b) => a.s - b.s);
+  const twice = defs.find((d, i) => defs.findIndex((x) => x.id === d.id) !== i);
+  if (twice) throw new CliError(`two shots are called "${twice.id}"; every shot needs its own id`);
   const sources = findShotSources(cfg, new Set(defs.filter((d) => !d.file).map((d) => d.id)));
   const shots = defs.map((d, i) => ({ id: d.id, s: d.s, e: defs[i + 1]?.s ?? facts.duration, file: d.file ?? sources.get(d.id) }));
   const lines = loadLines(cfg.lyrics);

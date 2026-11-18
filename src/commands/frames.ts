@@ -1,7 +1,6 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
-import type { Browser } from "playwright-core";
 import type { Args } from "../args";
 import { launchBrowser, shootPicture, withSession, type Session } from "../browser";
 import { difference, grabFrame, pool, probeVideo, type Crop } from "../ffmpeg";
@@ -135,55 +134,48 @@ export async function frames(p: Project, args: Args, cwd: string): Promise<Resul
   const pairs = other ? 2 : 1;
   const asked = { cols: args.num("cols") ?? (other ? 2 : 4), width: args.num("width") ?? 480 };
   if (!(asked.cols >= 1) || !(rows >= 1) || !(asked.width >= 16)) throw new CliError("--cols and --rows must be at least 1, --width at least 16");
-  const { cols, width, changed } = fitSheet(asked.cols, asked.width, pairs, args.num("max-width") ?? 2000);
+  const maxWidth = args.num("max-width") ?? 2000;
+  const { cols, width, changed } = fitSheet(asked.cols, asked.width, pairs, maxWidth);
+  if (width < 16) throw new CliError(`--max-width ${maxWidth} leaves no room for ${pairs > 1 ? "two pictures side by side" : "a picture"}; give at least ${16 * pairs + 16 + 2 * (pairs - 1)}`);
   const name = (f: string) => basename(f, extname(f));
   const sourceA = video ? basename(video) : "live page";
 
-  // Shoots, compares and composes; with the live page it is run again from the start if the page reloads under it.
-  const produce = async (browser: Browser, session: Session | null): Promise<Result> => {
-    const work = mkdtempSync(resolve(tmpdir(), "beatclip-"));
-    try {
-      const a = video ? await shootVideo(p, video, times, width, work, "a", crop) : await shootLive(session!, p, times, width, work, "a", crop);
-      const b = other ? await shootVideo(p, other, times, width, work, "b", crop) : null;
-      // When comparing, each label carries how different the two pictures are (0 = identical, see `differences`).
-      const aspect = crop ? crop.w / crop.h : p.cfg.page.width / p.cfg.page.height;
-      const diffs = b ? await pool(times, 6, (_, i) => difference(a[i], b[i], aspect, crop ? Math.min(480, Math.round(crop.w)) : 480)) : null;
-      const beatStep = args.has("beats") ? (args.has("half") ? 0.5 : 1) : null;
-      const tiles: Tile[] = times.map((t, i) => ({
-        images: b ? [a[i], b[i]] : [a[i]],
-        label: tileLabel(p, t, beatStep) + (diffs ? `  diff ${diffs[i].toFixed(1)}${diffs[i] >= p.cfg.differs ? " ≠" : ""}` : ""),
-      }));
-      const cut = crop ? `  ·  crop ${crop.x},${crop.y} ${crop.w}x${crop.h}` : "";
-      const title = `${slug}  ·  ${other ? `left: ${sourceA}  ·  right: ${basename(other)}` : sourceA}${cut}  ·  ${times.length} frames  ·  ${new Date().toLocaleString()}`;
-
-      const explicit = args.str("out") && resolve(cwd, args.str("out")!);
-      const base = `${stamp()}-${slug}${video ? `-${name(video)}` : ""}${other ? `-vs-${name(other)}` : ""}`;
-      const dest = (n: number, pages: number) => {
-        const suffix = pages > 1 ? `-${n + 1}of${pages}` : "";
-        return explicit ? resolve(dirname(explicit), `${name(explicit)}${suffix}.png`) : uniquePath(p.cfg.out.sheets, `${base}${suffix}`, "png");
-      };
-      const sheets = await composeSheets(browser, { title, tiles, cols, width, perSheet: cols * rows }, work, dest);
-      const data = {
-        sheets,
-        source: sourceA,
-        compare: other ? basename(other) : null,
-        crop: crop ?? null,
-        layout: { cols, width, adjusted: changed },
-        tiles: times.map((t, i) => ({ t: round3(t), time: fmtTime(t), label: tiles[i].label, ...(diffs ? { diff: round3(diffs[i]), differs: diffs[i] >= p.cfg.differs } : {}) })),
-      };
-      const differing = diffs ? `; ${diffs.filter((d) => d >= p.cfg.differs).length} of ${times.length} differ (diff >= ${p.cfg.differs})` : "";
-      const summary = `${times.length} frames from ${sourceA}${other ? ` beside ${basename(other)}` : ""}: ${fmtTime(times[0])} to ${fmtTime(times.at(-1)!)}${differing}`;
-      return { data, text: [...sheets, summary, ...(changed ? [changed] : [])].join("\n") };
-    } finally {
-      rmSync(work, { recursive: true, force: true });
-    }
-  };
-
-  if (!video) return withSession(p.cfg, (session) => produce(session.browser, session));
-  const browser = await launchBrowser(p.cfg);
+  const work = mkdtempSync(resolve(tmpdir(), "beatclip-"));
   try {
-    return await produce(browser, null);
+    // Only the shooting of the live page is run again when the page reloads under it; the sheet is composed once.
+    const a = video ? await shootVideo(p, video, times, width, work, "a", crop) : await withSession(p.cfg, (session) => shootLive(session, p, times, width, work, "a", crop));
+    const b = other ? await shootVideo(p, other, times, width, work, "b", crop) : null;
+    // When comparing, each label carries how different the two pictures are (0 = identical, see `differences`).
+    const aspect = crop ? crop.w / crop.h : p.cfg.page.width / p.cfg.page.height;
+    const diffs = b ? await pool(times, 6, (_, i) => difference(a[i], b[i], aspect, crop ? Math.min(480, Math.round(crop.w)) : 480)) : null;
+    const beatStep = args.has("beats") ? (args.has("half") ? 0.5 : 1) : null;
+    const tiles: Tile[] = times.map((t, i) => ({
+      images: b ? [a[i], b[i]] : [a[i]],
+      label: tileLabel(p, t, beatStep) + (diffs ? `  diff ${diffs[i].toFixed(1)}${diffs[i] >= p.cfg.differs ? " ≠" : ""}` : ""),
+    }));
+    const cut = crop ? `  ·  crop ${crop.x},${crop.y} ${crop.w}x${crop.h}` : "";
+    const title = `${slug}  ·  ${other ? `left: ${sourceA}  ·  right: ${basename(other)}` : sourceA}${cut}  ·  ${times.length} frames  ·  ${new Date().toLocaleString()}`;
+
+    const explicit = args.str("out") && resolve(cwd, args.str("out")!);
+    const base = `${stamp()}-${slug}${video ? `-${name(video)}` : ""}${other ? `-vs-${name(other)}` : ""}`;
+    const dest = (n: number, pages: number) => {
+      const suffix = pages > 1 ? `-${n + 1}of${pages}` : "";
+      return explicit ? resolve(dirname(explicit), `${name(explicit)}${suffix}.png`) : uniquePath(p.cfg.out.sheets, `${base}${suffix}`, "png");
+    };
+    const browser = await launchBrowser(p.cfg);
+    const sheets = await composeSheets(browser, { title, tiles, cols, width, perSheet: cols * rows }, work, dest).finally(() => browser.close());
+    const data = {
+      sheets,
+      source: sourceA,
+      compare: other ? basename(other) : null,
+      crop: crop ?? null,
+      layout: { cols, width, adjusted: changed },
+      tiles: times.map((t, i) => ({ t: round3(t), time: fmtTime(t), label: tiles[i].label, ...(diffs ? { diff: round3(diffs[i]), differs: diffs[i] >= p.cfg.differs } : {}) })),
+    };
+    const differing = diffs ? `; ${diffs.filter((d) => d >= p.cfg.differs).length} of ${times.length} differ (diff >= ${p.cfg.differs})` : "";
+    const summary = `${times.length} frames from ${sourceA}${other ? ` beside ${basename(other)}` : ""}: ${fmtTime(times[0])} to ${fmtTime(times.at(-1)!)}${differing}`;
+    return { data, text: [...sheets, summary, ...(changed ? [changed] : [])].join("\n") };
   } finally {
-    await browser.close();
+    rmSync(work, { recursive: true, force: true });
   }
 }
